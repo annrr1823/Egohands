@@ -1,0 +1,21 @@
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+accelerate launch --config_file ./accelerate/4_gpus_config.yaml --main_process_port 29630 --mixed_precision="no" train.py \
+  --resume_from_checkpoint="latest" \
+  --model_version="1_0" \
+  --dataset_name="dexycb" \
+  --dataset_version="1_0" \
+  --output_dir="../ckpt/v__1_0__dexycb_1_0" \
+  --tracker_project_name="training" \
+  --train_batch_size=8 \
+  --dataloader_num_workers=8 \
+  --gradient_accumulation_steps=1 \
+  --checkpointing_epochs=5 \
+  --num_train_epochs=20 \
+  --learning_rate=2e-4 \
+  --learning_rate_scale=0.5 \
+  --scheduler_pct_start=0.05 \
+  --scheduler_anneal_strategy=cos \
+  --scheduler_div_factor=10.0 \
+  --scheduler_final_div_factor=20.0 \
+  --max_grad_norm=1.0 \

@@ -1,0 +1,6 @@
+experiment/ckpt/
+.vscode/
+.codex
+third_party/
+
+_DATA/
