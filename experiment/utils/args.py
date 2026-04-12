@@ -91,6 +91,7 @@ def parse_args_training():
         "--pretrained_path",
         type=str,
         default=None,
+        # default="/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt",
         required=False,
         help="Path to pretrained model.",
     )
@@ -114,6 +115,12 @@ def parse_args_training():
         default="1_0",
         choices=["1_0", "2_0"],
         help="Dataset version to instantiate.",
+    )
+    parser.add_argument(
+        "--sequence_length",
+        type=int,
+        default=8,
+        help="Temporal window length for sequence datasets (e.g., arctic 2_0).",
     )
     parser.add_argument(
         "--point_dropout_prob",

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-DEFAULT_HAMER_CKPT = "/data/sunzhihao/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
+DEFAULT_HAMER_CKPT = "/data/sunzhihao2/turuirui/dataset/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
 
 
 class HaMeREncoder(nn.Module):

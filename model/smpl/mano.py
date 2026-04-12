@@ -14,6 +14,21 @@ import numpy as np
 import pickle
 import torch
 
+
+def _ensure_numpy_legacy_aliases() -> None:
+    legacy_aliases = {
+        "bool": bool,
+        "int": int,
+        "float": float,
+        "complex": complex,
+        "object": object,
+        "unicode": str,
+        "str": str,
+    }
+    for alias_name, alias_value in legacy_aliases.items():
+        if not hasattr(np, alias_name):
+            setattr(np, alias_name, alias_value)
+
 import smplx
 from smplx.lbs import lbs, batch_rodrigues
 from smplx.vertex_ids import vertex_ids as VERTEX_IDS
@@ -55,6 +70,8 @@ class MANOLayer(smplx.SMPL):
 
         # If no data structure is passed, load the data from the given model folder.
         if data_struct is None:
+            _ensure_numpy_legacy_aliases()
+
             # Load the model
             if os.path.isdir(model_path):
                 model_fn = 'MANO_{}.{ext}'.format(

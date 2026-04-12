@@ -5,7 +5,7 @@ import sys
 import torch
 from torch import nn
 
-DEFAULT_SAM3DB_CKPT = "/data/sunzhihao/egohands/third_party/ckpt/model_dino.ckpt"
+DEFAULT_SAM3DB_CKPT = "/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt"
 
 
 class DinoBackbone(nn.Module):

@@ -19,9 +19,10 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 import transformers
 
-from dataset.hand_rgb__1_0 import collate_fn_rgb
+from dataset.hand_rgb__2_0 import collate_fn_rgb
 from dataset.dexycb__1_0 import DexYCBRGBDataset as DexYCBRGBDataset__1_0
 from dataset.arctic__1_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__1_0
+from dataset.arctic__2_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__2_0
 from dataset.h2o__1_0 import H2OEgoRGBDataset as H2OEgoRGBDataset__1_0
 from model.egohands__1_0 import EgoHands as EgoHands__1_0
 from experiment.utils.args import parse_args_training
@@ -49,7 +50,7 @@ def build_dataset(args, split):
             return DexYCBRGBDataset__1_0(**dataset_args)
     elif args.dataset_name == "arctic":
         dataset_args = dict(
-            dataset_folder="/data/public/dataset/hand/arctic",
+            dataset_folder="/data/sunzhihao2/turuirui/dataset/arctic/data/data",
             image_size=(512, 512),
             split=split,
             setup="p1",
@@ -57,6 +58,11 @@ def build_dataset(args, split):
         )
         if args.dataset_version == "1_0":
             return ARCTICEgoRGBDataset__1_0(**dataset_args)
+        if args.dataset_version == "2_0":
+            return ARCTICEgoRGBDataset__2_0(
+                sequence_length=args.sequence_length,
+                **dataset_args,
+            )
     elif args.dataset_name == "h2o":
         dataset_args = dict(
             dataset_folder="/data/public/dataset/hand/h2o",
@@ -138,6 +144,7 @@ def main():
     if args.pretrained_path:
         logger.info(f"Loading pretrained weights from {args.pretrained_path}.")
         checkpoint = torch.load(args.pretrained_path, map_location="cpu")
+        # checkpoint = torch.load("/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt", map_location="cpu")
         state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict, strict=True)
     model.train()

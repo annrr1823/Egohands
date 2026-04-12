@@ -29,6 +29,8 @@ class EgoHands(nn.Module):
 
         self.decoder = BaseDecoder(
             input_dim=1280,
+            camera_param_dim=16,
+            camera_embed_dim=64,
         )
 
         self.mano_lhand = MANOLayer(model_path=MANO_PATH, is_rhand=False)
@@ -39,46 +41,102 @@ class EgoHands(nn.Module):
         for param in self.mano_rhand.parameters():
             param.requires_grad = False
 
+    @staticmethod
+    def _ensure_temporal_dim(x):
+        if x.dim() == 4:
+            return x.unsqueeze(1), False
+        return x, True
+
+    def _build_camera_param(self, batch, batch_size, seq_len, device, dtype):
+        intrinsics = batch["intrinsics"].to(device=device, dtype=dtype)
+        extrinsics = batch["extrinsics"].to(device=device, dtype=dtype)
+
+        if intrinsics.dim() == 3:
+            intrinsics = intrinsics.unsqueeze(1)
+        if intrinsics.dim() == 4 and intrinsics.shape[2] == 1:
+            intrinsics = intrinsics.squeeze(2)
+
+        if extrinsics.dim() == 4:
+            extrinsics = extrinsics.unsqueeze(1)
+        if extrinsics.dim() == 5 and extrinsics.shape[2] == 1:
+            extrinsics = extrinsics.squeeze(2)
+
+        intrinsics = intrinsics.reshape(batch_size, seq_len, 4)
+        extrinsics = extrinsics.reshape(batch_size, seq_len, 12)
+        return torch.cat([intrinsics, extrinsics], dim=-1)
+
     def forward(self, batch, weight_dtype):
         images = batch["image"].to(weight_dtype)
         left_hand_images = batch["left_hand_image"].to(weight_dtype)
         right_hand_images = batch["right_hand_image"].to(weight_dtype)
-
         betas_gt = batch["betas"].to(weight_dtype)
 
-        body_feat = self.body_backbone(images)
-        batch_size, feat_dim, feat_height, feat_width = body_feat.shape
-        body_tokens = body_feat.permute(0, 2, 3, 1).reshape(batch_size, feat_height * feat_width, feat_dim)
+        images, has_temporal = self._ensure_temporal_dim(images)
+        left_hand_images, _ = self._ensure_temporal_dim(left_hand_images)
+        right_hand_images, _ = self._ensure_temporal_dim(right_hand_images)
 
-        hand_images = torch.stack([left_hand_images, right_hand_images], dim=1)
+        # betas are [B, 2, 10] (single frame) or [B, T, 2, 10] (temporal);
+        # only single-frame inputs need a temporal dimension.
+        if betas_gt.dim() == 3:
+            betas_gt = betas_gt.unsqueeze(1)
+
+        batch_size, seq_len, _, _, _ = images.shape
+
+        images_bt = images.reshape(batch_size * seq_len, *images.shape[2:])
+        left_hand_images_bt = left_hand_images.reshape(batch_size * seq_len, *left_hand_images.shape[2:])
+        right_hand_images_bt = right_hand_images.reshape(batch_size * seq_len, *right_hand_images.shape[2:])
+        betas_bt = betas_gt.reshape(batch_size * seq_len, *betas_gt.shape[2:])
+
+        body_feat = self.body_backbone(images_bt)
+        bt, feat_dim, feat_height, feat_width = body_feat.shape
+        body_tokens = body_feat.permute(0, 2, 3, 1).reshape(bt, feat_height * feat_width, feat_dim)
+
+        camera_param = self._build_camera_param(
+            batch=batch,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=body_tokens.device,
+            dtype=body_tokens.dtype,
+        )
+        camera_param_bt = camera_param.reshape(batch_size * seq_len, -1)
+
+        hand_images = torch.stack([left_hand_images_bt, right_hand_images_bt], dim=1)
         hand_feat = self.hand_backbone(hand_images)
-        batch_size, num_side, feat_dim, feat_height, feat_width = hand_feat.shape
-        hand_tokens = hand_feat.permute(0, 1, 3, 4, 2).reshape(batch_size, num_side, feat_height * feat_width, feat_dim)
+        bt, num_side, feat_dim, feat_height, feat_width = hand_feat.shape
+        hand_tokens = hand_feat.permute(0, 1, 3, 4, 2).reshape(bt, num_side, feat_height * feat_width, feat_dim)
 
-        outputs = self.decoder(hand_tokens, body_tokens)
-
-        pose_pred = outputs["pose"]
-        transl_pred = outputs["transl"]
+        outputs_bt = self.decoder(hand_tokens, body_tokens, camera_param=camera_param_bt)
+        pose_pred_bt = outputs_bt["pose"]
+        transl_pred_bt = outputs_bt["transl"]
 
         mano_outputs_left = self.mano_lhand(
             pose_type="rot6d",
-            betas=betas_gt[:, 0],
-            global_orient=pose_pred[:, 0, :1],
-            hand_pose=pose_pred[:, 0, 1:],
-            transl=transl_pred[:, 0],
+            betas=betas_bt[:, 0],
+            global_orient=pose_pred_bt[:, 0, :1],
+            hand_pose=pose_pred_bt[:, 0, 1:],
+            transl=transl_pred_bt[:, 0],
         )
         mano_outputs_right = self.mano_rhand(
             pose_type="rot6d",
-            betas=betas_gt[:, 1],
-            global_orient=pose_pred[:, 1, :1],
-            hand_pose=pose_pred[:, 1, 1:],
-            transl=transl_pred[:, 1],
+            betas=betas_bt[:, 1],
+            global_orient=pose_pred_bt[:, 1, :1],
+            hand_pose=pose_pred_bt[:, 1, 1:],
+            transl=transl_pred_bt[:, 1],
         )
 
-        joints3d_pred = torch.stack(
+        joints3d_pred_bt = torch.stack(
             [mano_outputs_left["joints"], mano_outputs_right["joints"]],
             dim=1,
         )
+
+        pose_pred = pose_pred_bt.reshape(batch_size, seq_len, 2, 16, 6)
+        transl_pred = transl_pred_bt.reshape(batch_size, seq_len, 2, 3)
+        joints3d_pred = joints3d_pred_bt.reshape(batch_size, seq_len, 2, 21, 3)
+
+        if not has_temporal:
+            pose_pred = pose_pred[:, 0]
+            transl_pred = transl_pred[:, 0]
+            joints3d_pred = joints3d_pred[:, 0]
 
         outputs = {
             "pose": pose_pred,
@@ -161,17 +219,32 @@ class EgoHands(nn.Module):
         mpjpe = (mpjpe * hand_side_mask).sum() / (hand_side_mask.sum() + eps)
 
         pa_mpjpe_sum = joints3d_pred.new_zeros(())
-        batch_size, num_hands = hand_side_mask.shape
+
+        if hand_side_mask.dim() == 2:
+            joints3d_eval = joints3d.unsqueeze(1)
+            joints3d_pred_eval = joints3d_pred.unsqueeze(1)
+            hand_side_mask_eval = hand_side_mask.unsqueeze(1)
+        else:
+            joints3d_eval = joints3d
+            joints3d_pred_eval = joints3d_pred
+            hand_side_mask_eval = hand_side_mask
+
+        eval_batch = joints3d_eval.shape[0] * joints3d_eval.shape[1]
+        joints3d_eval = joints3d_eval.reshape(eval_batch, 2, 21, 3)
+        joints3d_pred_eval = joints3d_pred_eval.reshape(eval_batch, 2, 21, 3)
+        hand_side_mask_eval = hand_side_mask_eval.reshape(eval_batch, 2)
+
+        batch_size, num_hands = hand_side_mask_eval.shape
         for batch_idx in range(batch_size):
             for hand_idx in range(num_hands):
-                if hand_side_mask[batch_idx, hand_idx] <= 0:
+                if hand_side_mask_eval[batch_idx, hand_idx] <= 0:
                     continue
                 pred_aligned = self._align_w_scale(
-                    joints3d[batch_idx, hand_idx],
-                    joints3d_pred[batch_idx, hand_idx],
+                    joints3d_eval[batch_idx, hand_idx],
+                    joints3d_pred_eval[batch_idx, hand_idx],
                 )
                 pa_mpjpe_sum = pa_mpjpe_sum + torch.norm(
-                    pred_aligned - joints3d[batch_idx, hand_idx],
+                    pred_aligned - joints3d_eval[batch_idx, hand_idx],
                     dim=-1,
                 ).mean()
         pa_mpjpe = pa_mpjpe_sum / (hand_side_mask.sum() + eps)
