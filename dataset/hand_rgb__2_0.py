@@ -140,12 +140,14 @@ class HandRGBDataset(Dataset):
             if seq_length < self.sequence_length:
                 continue
 
-            self.sequence_windows.append({
-                "mode": "temporal",
-                "seq_id": seq["seq_id"],
-                "seq_start": seq["start"],
-                "max_offset": seq_length - self.sequence_length,
-            })
+            max_offset = seq_length - self.sequence_length
+            for offset in range(0, max_offset + 1, self.sequence_length):
+                self.sequence_windows.append({
+                    "mode": "temporal",
+                    "seq_id": seq["seq_id"],
+                    "seq_start": seq["start"],
+                    "offset": offset,
+                })
 
         print(
             f"[INFO] Built {len(self.sequence_windows)} windows with sequence_length={self.sequence_length}."
@@ -175,11 +177,7 @@ class HandRGBDataset(Dataset):
             frame = self.frames[window["frame_idx"]]
             return self._build_single_sample(frame=frame, index=idx)
 
-        max_offset = window["max_offset"]
-        if getattr(self, "split", None) == "train":
-            offset = self.random.randint(0, max_offset)
-        else:
-            offset = 0
+        offset = window["offset"]
 
         start = window["seq_start"] + offset
         clip_frames = self.frames[start:start + self.sequence_length]

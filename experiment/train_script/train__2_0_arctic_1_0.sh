@@ -1,7 +1,6 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 accelerate launch --config_file ./accelerate/8_gpus_config.yaml --main_process_port 29630 --mixed_precision="no" train.py \
-  --resume_from_checkpoint="latest" \
   --model_version="1_0" \
   --dataset_name="arctic" \
   --dataset_version="2_0" \

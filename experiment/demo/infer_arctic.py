@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -19,16 +18,17 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset.hand_rgb__1_0 import collate_fn_rgb
+from dataset.hand_rgb__2_0 import collate_fn_rgb
 from dataset.arctic__1_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__1_0
+from dataset.arctic__2_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__2_0
 from dataset.dexycb__1_0 import DexYCBRGBDataset as DexYCBRGBDataset__1_0
 from dataset.h2o__1_0 import H2OEgoRGBDataset as H2OEgoRGBDataset__1_0
 from model.egohands__1_0 import EgoHands as EgoHands__1_0
 
 
-# python /data/turuirui/egohands/experiment/demo/infer_arctic.py \
-#   --checkpoint_path /data/turuirui/egohands/experiment/ckpt/v__1_0__arctic_1_0/best_mpjpe.pth \
-#   --output_dir /data/turuirui/arctic_pipeline/outputs/egohands \
+# python /data/sunzhihao2/turuirui/egohands/experiment/demo/infer_arctic.py \
+#   --checkpoint_path /data/sunzhihao2/turuirui/egohands/experiment/ckpt/v__4_0__arctic_1_0/best_mpjpe.pth \
+#   --output_dir /data/sunzhihao2/turuirui/arctic_pipeline/outputs/egohands_3 \
 #   --dataset_name arctic \
 #   --split val \
 #   --batch_size 16 \
@@ -40,6 +40,12 @@ def parse_args():
 
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to trained checkpoint (.pth).")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save .npz prediction files.")
+    parser.add_argument(
+        "--dataset_folder",
+        type=str,
+        default=None,
+        help="Override dataset root folder. If omitted, use built-in defaults by dataset_name.",
+    )
 
     parser.add_argument(
         "--dataset_name",
@@ -51,8 +57,8 @@ def parse_args():
     parser.add_argument(
         "--dataset_version",
         type=str,
-        default="1_0",
-        choices=["1_0"],
+        default="2_0",
+        choices=["1_0", "2_0"],
         help="Dataset version.",
     )
     parser.add_argument(
@@ -73,6 +79,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--seed", type=int, default=618, help="Random seed for dataset internals.")
+    parser.add_argument(
+        "--sequence_length",
+        type=int,
+        default=8,
+        help="Temporal window length for sequence datasets (e.g., arctic 2_0).",
+    )
 
     parser.add_argument(
         "--device",
@@ -115,9 +127,17 @@ def build_model(args):
 
 
 def build_dataset(args, split):
+    dataset_folder_map = {
+        "dexycb": "/data/public/dataset/hand/dexycb",
+        "arctic": "/data/sunzhihao2/turuirui/dataset/arctic/data/data",
+        "h2o": "/data/public/dataset/hand/h2o",
+    }
+
+    dataset_folder = args.dataset_folder or dataset_folder_map[args.dataset_name]
+
     if args.dataset_name == "dexycb":
         dataset_args = dict(
-            dataset_folder="/data/public/dataset/hand/dexycb",
+            dataset_folder=dataset_folder,
             image_size=(512, 512),
             split=split,
             setup="s0",
@@ -127,7 +147,7 @@ def build_dataset(args, split):
             return DexYCBRGBDataset__1_0(**dataset_args)
     elif args.dataset_name == "arctic":
         dataset_args = dict(
-            dataset_folder="/data/public/dataset/hand/arctic",
+            dataset_folder=dataset_folder,
             image_size=(512, 512),
             split=split,
             setup="p1",
@@ -135,9 +155,11 @@ def build_dataset(args, split):
         )
         if args.dataset_version == "1_0":
             return ARCTICEgoRGBDataset__1_0(**dataset_args)
+        if args.dataset_version == "2_0":
+            return ARCTICEgoRGBDataset__2_0(sequence_length=args.sequence_length, **dataset_args)
     elif args.dataset_name == "h2o":
         dataset_args = dict(
-            dataset_folder="/data/public/dataset/hand/h2o",
+            dataset_folder=dataset_folder,
             image_size=(512, 512),
             split=split,
             setup="default",
@@ -195,6 +217,25 @@ def save_prediction(save_path: Path, image_path: str, kp3d_pred: np.ndarray, ext
     np.savez_compressed(save_path, **payload)
 
 
+def ensure_temporal_outputs(outputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    pose_pred = outputs["pose"]
+    transl_pred = outputs["transl"]
+
+    if pose_pred.dim() == 4:
+        pose_pred = pose_pred.unsqueeze(1)
+    if transl_pred.dim() == 3:
+        transl_pred = transl_pred.unsqueeze(1)
+
+    return pose_pred, transl_pred
+
+
+def get_meta_frame_path(meta: dict, time_index: int) -> str:
+    frame_ids = meta.get("frame_ids")
+    if isinstance(frame_ids, list):
+        return str(frame_ids[time_index])
+    return str(meta.get("frame_id", ""))
+
+
 def build_eval_kp3d_pred(model, pose_pred: torch.Tensor, transl_pred: torch.Tensor, hand_side_mask: torch.Tensor, betas: torch.Tensor) -> np.ndarray:
     # ARCTIC eval expects full-camera MANO joints in [left(21), right(21)] order.
     # If a future model emits crop-space translation, the crop->full recovery belongs here.
@@ -232,6 +273,8 @@ def main():
     model = build_model(args)
     checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    if isinstance(state_dict, dict) and any(key.startswith("module.") for key in state_dict.keys()):
+        state_dict = {key.replace("module.", "", 1): value for key, value in state_dict.items()}
     model.load_state_dict(state_dict, strict=True)
 
     device = torch.device(args.device)
@@ -267,41 +310,49 @@ def main():
             with autocast_ctx():
                 _, _, outputs = model(batch_device, weight_dtype=weight_dtype)
 
-            pose_pred = outputs["pose"].detach().cpu().numpy()
-            transl_pred = outputs["transl"].detach().cpu().numpy()
-            hand_side_mask = batch["hand_side_mask"].detach().cpu().numpy()
+            pose_pred_t, transl_pred_t = ensure_temporal_outputs(outputs)
+            pose_pred = pose_pred_t.detach().cpu().numpy()
+            transl_pred = transl_pred_t.detach().cpu().numpy()
+
+            hand_side_mask_t = batch["hand_side_mask"]
+            if hand_side_mask_t.dim() == 2:
+                hand_side_mask_t = hand_side_mask_t.unsqueeze(1)
+            hand_side_mask = hand_side_mask_t.detach().cpu().numpy()
 
             metas = batch["meta"]
+            seq_len = pose_pred_t.shape[1]
             for i in range(batch_size):
                 meta = metas[i]
-                image_path = meta["frame_id"]
-                save_name = build_output_name(image_path)
-                save_path = output_dir / save_name
+                for t in range(seq_len):
+                    image_path = get_meta_frame_path(meta, t)
+                    save_name = build_output_name(image_path)
+                    save_path = output_dir / save_name
 
-                if save_path.exists() and not args.overwrite:
-                    skipped_files += 1
-                    continue
+                    if save_path.exists() and not args.overwrite:
+                        skipped_files += 1
+                        continue
 
-                kp3d_pred = build_eval_kp3d_pred(
-                    model=model,
-                    pose_pred=outputs["pose"][i],
-                    transl_pred=outputs["transl"][i],
-                    hand_side_mask=torch.as_tensor(hand_side_mask[i]),
-                    betas=batch_device["betas"][i],
-                )
+                    kp3d_pred = build_eval_kp3d_pred(
+                        model=model,
+                        pose_pred=pose_pred_t[i, t],
+                        transl_pred=transl_pred_t[i, t],
+                        hand_side_mask=torch.as_tensor(hand_side_mask[i, t]),
+                        betas=batch_device["betas"][i, t],
+                    )
 
-                extra = {
-                    "pose_pred": pose_pred[i].astype(np.float32),
-                    "transl_pred": transl_pred[i].astype(np.float32),
-                    "hand_side_mask": hand_side_mask[i].astype(np.float32),
-                    "coord_semantics": "camera",
-                    "joint_order": "openpose",
-                    "seq_id": str(meta.get("seq_id", "")),
-                    "frame_id": str(meta.get("frame_id", "")),
-                }
+                    extra = {
+                        "pose_pred": pose_pred[i, t].astype(np.float32),
+                        "transl_pred": transl_pred[i, t].astype(np.float32),
+                        "hand_side_mask": hand_side_mask[i, t].astype(np.float32),
+                        "coord_semantics": "camera",
+                        "joint_order": "openpose",
+                        "seq_id": str(meta.get("seq_id", "")),
+                        "frame_id": str(image_path),
+                        "temporal_index": int(t),
+                    }
 
-                save_prediction(save_path, image_path, kp3d_pred, extra=extra)
-                saved_files += 1
+                    save_prediction(save_path, image_path, kp3d_pred, extra=extra)
+                    saved_files += 1
 
             total_samples += batch_size
             pbar.set_postfix(saved=saved_files, skipped=skipped_files)
@@ -309,7 +360,9 @@ def main():
     summary = {
         "dataset_name": args.dataset_name,
         "dataset_version": args.dataset_version,
+        "sequence_length": args.sequence_length,
         "model_version": args.model_version,
+        "dataset_folder": str(args.dataset_folder) if args.dataset_folder else "<default>",
         "split": args.split,
         "checkpoint_path": args.checkpoint_path,
         "output_dir": str(output_dir),
