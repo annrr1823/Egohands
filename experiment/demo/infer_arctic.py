@@ -69,6 +69,11 @@ def parse_args():
         help="Model version to instantiate.",
     )
     parser.add_argument(
+        "--use_plucker_ray",
+        action="store_true",
+        help="Fuse patch-level Plucker ray geometry into the body token stream.",
+    )
+    parser.add_argument(
         "--split",
         type=str,
         default="val",
@@ -122,7 +127,7 @@ def parse_args():
 
 def build_model(args):
     if args.model_version == "1_0":
-        return EgoHands__1_0()
+        return EgoHands__1_0(use_plucker_ray=args.use_plucker_ray)
     raise ValueError(f"Unsupported model_version: {args.model_version}")
 
 
@@ -217,6 +222,13 @@ def save_prediction(save_path: Path, image_path: str, kp3d_pred: np.ndarray, ext
     np.savez_compressed(save_path, **payload)
 
 
+def checkpoint_has_plucker_keys(state_dict: dict) -> bool:
+    return any(
+        key.startswith("plucker_proj.") or key.startswith("plucker_ray.")
+        for key in state_dict.keys()
+    )
+
+
 def ensure_temporal_outputs(outputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
     pose_pred = outputs["pose"]
     transl_pred = outputs["transl"]
@@ -270,12 +282,30 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(args)
     checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
     if isinstance(state_dict, dict) and any(key.startswith("module.") for key in state_dict.keys()):
         state_dict = {key.replace("module.", "", 1): value for key, value in state_dict.items()}
-    model.load_state_dict(state_dict, strict=True)
+
+    ckpt_has_plucker = isinstance(state_dict, dict) and checkpoint_has_plucker_keys(state_dict)
+    if ckpt_has_plucker and not args.use_plucker_ray:
+        print("[infer_arctic] Detected Plucker-ray weights in checkpoint; enabling --use_plucker_ray automatically.")
+        args.use_plucker_ray = True
+
+    model = build_model(args)
+
+    strict_loading = True
+    if args.use_plucker_ray and not ckpt_has_plucker:
+        strict_loading = False
+        print("[infer_arctic] --use_plucker_ray is enabled but checkpoint has no Plucker weights; loading non-strictly.")
+
+    incompatible = model.load_state_dict(state_dict, strict=strict_loading)
+    if not strict_loading and (incompatible.missing_keys or incompatible.unexpected_keys):
+        print(
+            "[infer_arctic] Non-strict load details: "
+            f"missing_keys={len(incompatible.missing_keys)}, "
+            f"unexpected_keys={len(incompatible.unexpected_keys)}"
+        )
 
     device = torch.device(args.device)
     model = model.to(device)
@@ -362,6 +392,7 @@ def main():
         "dataset_version": args.dataset_version,
         "sequence_length": args.sequence_length,
         "model_version": args.model_version,
+        "use_plucker_ray": args.use_plucker_ray,
         "dataset_folder": str(args.dataset_folder) if args.dataset_folder else "<default>",
         "split": args.split,
         "checkpoint_path": args.checkpoint_path,

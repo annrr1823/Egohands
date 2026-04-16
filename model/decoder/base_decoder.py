@@ -12,10 +12,6 @@ class BaseDecoder(nn.Module):
     def __init__(
         self, 
         input_dim=1280,
-        camera_param_dim=16,
-        camera_embed_dim=64,
-        camera_embed_mid_dim=32,
-        camera_embed_dropout=0.25,
     ):
         super().__init__()
 
@@ -28,8 +24,6 @@ class BaseDecoder(nn.Module):
         self.pose_dim = 16 * 6
         self.transl_dim = 3
         self.joints3d_dim = 21 * 3
-        self.camera_param_dim = camera_param_dim
-        self.camera_embed_dim = camera_embed_dim
 
         mean_params = np.load(self.mean_params_path)
         init_pose = torch.from_numpy(mean_params["pose"].astype(np.float32)).unsqueeze(0)
@@ -55,19 +49,6 @@ class BaseDecoder(nn.Module):
         )
 
         self._load_pretrained_decoder(self.hamer_ckpt)
-
-        self.camera_embedding = self.camera_param_dim > 0 and self.camera_embed_dim > 0
-        if self.camera_embedding:
-            self.camera_embed_fc1 = nn.Linear(self.camera_param_dim, camera_embed_mid_dim)
-            self.camera_embed_bn1 = nn.BatchNorm1d(camera_embed_mid_dim)
-            self.camera_embed_fc2 = nn.Linear(camera_embed_mid_dim, self.camera_embed_dim)
-            self.camera_embed_bn2 = nn.BatchNorm1d(self.camera_embed_dim)
-            self.camera_embed_act = nn.LeakyReLU(0.2, inplace=True)
-            self.camera_embed_drop = nn.Dropout(camera_embed_dropout)
-
-            fused_dim = self.hidden_dim + self.camera_embed_dim
-            self.pose_fuse = nn.Linear(fused_dim, self.hidden_dim)
-            self.transl_fuse = nn.Linear(fused_dim, self.hidden_dim)
 
         self.pose_head = nn.Linear(self.hidden_dim, self.pose_dim)
         self.transl_head = nn.Linear(self.hidden_dim, self.transl_dim)
@@ -108,20 +89,7 @@ class BaseDecoder(nn.Module):
                 f"unexpected keys: {unexpected}"
             )
 
-    def _embed_camera_param(self, camera_param):
-        x = self.camera_embed_fc1(camera_param)
-        x = self.camera_embed_bn1(x)
-        x = self.camera_embed_act(x)
-        x = self.camera_embed_drop(x)
-
-        x = self.camera_embed_fc2(x)
-        x = self.camera_embed_bn2(x)
-        x = self.camera_embed_act(x)
-        x = self.camera_embed_drop(x)
-
-        return x
-
-    def forward(self, hand_tokens, body_tokens, camera_param=None):
+    def forward(self, hand_tokens, body_tokens):
         batch_size = body_tokens.shape[0]
 
         left_init_pose = self.init_pose.expand(batch_size, -1)
@@ -150,20 +118,6 @@ class BaseDecoder(nn.Module):
             context2=body_tokens,
             context2_mask=None,
         )
-
-        if self.camera_embedding and camera_param is not None:
-            camera_embed = self._embed_camera_param(camera_param)
-            camera_embed = camera_embed.unsqueeze(1).expand(-1, 4, -1)
-
-            pose_tokens = torch.cat([tokens[:, [0, 2]], camera_embed[:, [0, 2]]], dim=-1)
-            transl_tokens = torch.cat([tokens[:, [1, 3]], camera_embed[:, [1, 3]]], dim=-1)
-
-            pose_tokens = self.pose_fuse(pose_tokens)
-            transl_tokens = self.transl_fuse(transl_tokens)
-
-            tokens = tokens.clone()
-            tokens[:, [0, 2]] = pose_tokens
-            tokens[:, [1, 3]] = transl_tokens
 
         left_pose_pred = left_init_pose + self.pose_head(tokens[:, 0])
         left_transl_pred = self.transl_head(tokens[:, 1])

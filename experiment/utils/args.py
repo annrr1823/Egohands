@@ -103,6 +103,11 @@ def parse_args_training():
         help="Model version to instantiate.",
     )
     parser.add_argument(
+        "--use_plucker_ray",
+        action="store_true",
+        help="Fuse patch-level Plucker ray geometry into the body token stream.",
+    )
+    parser.add_argument(
         "--dataset_name",
         type=str,
         default="h2o",

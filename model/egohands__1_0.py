@@ -14,11 +14,14 @@ from model.backbone.dinov3 import DinoBackbone
 from model.backbone.hamer import HaMeREncoder
 from model.decoder.base_decoder import BaseDecoder
 from model.smpl.mano import MANOLayer, MANO_PATH
+from model.utils.plucker_ray import PluckerRayEmbedding
 
 
 class EgoHands(nn.Module):
-    def __init__(self):
+    def __init__(self, use_plucker_ray: bool = False):
         super().__init__()
+
+        self.use_plucker_ray = use_plucker_ray
 
         self.body_backbone = DinoBackbone(
             freeze_params=False,
@@ -29,9 +32,18 @@ class EgoHands(nn.Module):
 
         self.decoder = BaseDecoder(
             input_dim=1280,
-            camera_param_dim=16,
-            camera_embed_dim=64,
         )
+
+        if self.use_plucker_ray:
+            self.plucker_ray = PluckerRayEmbedding(
+                image_size=(512, 512),
+                patch_size=self.body_backbone.patch_size,
+            )
+            self.plucker_proj = nn.Sequential(
+                nn.Linear(6, self.body_backbone.embed_dim),
+                nn.LayerNorm(self.body_backbone.embed_dim),
+            )
+            self.plucker_alpha = nn.Parameter(torch.tensor(1.0))
 
         self.mano_lhand = MANOLayer(model_path=MANO_PATH, is_rhand=False)
         self.mano_rhand = MANOLayer(model_path=MANO_PATH, is_rhand=True)
@@ -47,23 +59,34 @@ class EgoHands(nn.Module):
             return x.unsqueeze(1), False
         return x, True
 
-    def _build_camera_param(self, batch, batch_size, seq_len, device, dtype):
-        intrinsics = batch["intrinsics"].to(device=device, dtype=dtype)
+    def _build_plucker_tokens(self, batch, batch_size, seq_len, device, dtype):
         extrinsics = batch["extrinsics"].to(device=device, dtype=dtype)
-
-        if intrinsics.dim() == 3:
-            intrinsics = intrinsics.unsqueeze(1)
-        if intrinsics.dim() == 4 and intrinsics.shape[2] == 1:
-            intrinsics = intrinsics.squeeze(2)
+        intrinsics = batch.get("intrinsics_resize", batch["intrinsics"]).to(device=device, dtype=dtype)
 
         if extrinsics.dim() == 4:
             extrinsics = extrinsics.unsqueeze(1)
         if extrinsics.dim() == 5 and extrinsics.shape[2] == 1:
             extrinsics = extrinsics.squeeze(2)
 
+        if intrinsics.dim() == 3:
+            intrinsics = intrinsics.unsqueeze(1)
+        if intrinsics.dim() == 4 and intrinsics.shape[2] == 1:
+            intrinsics = intrinsics.squeeze(2)
+
+        extrinsics = extrinsics.reshape(batch_size, seq_len, 3, 4)
         intrinsics = intrinsics.reshape(batch_size, seq_len, 4)
-        extrinsics = extrinsics.reshape(batch_size, seq_len, 12)
-        return torch.cat([intrinsics, extrinsics], dim=-1)
+
+        extrinsics_4x4 = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4).expand(batch_size, seq_len, 4, 4).clone()
+        extrinsics_4x4[..., :3, :] = extrinsics
+
+        plucker_tokens = self.plucker_ray.compute_patch_center_plucker(
+            extrinsics=extrinsics_4x4,
+            intrinsics=intrinsics,
+        )
+        plucker_tokens = plucker_tokens.reshape(batch_size * seq_len, plucker_tokens.shape[2], 6)
+        plucker_tokens = self.plucker_proj(plucker_tokens)
+
+        return plucker_tokens
 
     def forward(self, batch, weight_dtype):
         images = batch["image"].to(weight_dtype)
@@ -91,21 +114,22 @@ class EgoHands(nn.Module):
         bt, feat_dim, feat_height, feat_width = body_feat.shape
         body_tokens = body_feat.permute(0, 2, 3, 1).reshape(bt, feat_height * feat_width, feat_dim)
 
-        camera_param = self._build_camera_param(
-            batch=batch,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            device=body_tokens.device,
-            dtype=body_tokens.dtype,
-        )
-        camera_param_bt = camera_param.reshape(batch_size * seq_len, -1)
+        if self.use_plucker_ray:
+            plucker_tokens = self._build_plucker_tokens(
+                batch=batch,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=body_tokens.device,
+                dtype=body_tokens.dtype,
+            )
+            body_tokens = body_tokens + self.plucker_alpha * plucker_tokens
 
         hand_images = torch.stack([left_hand_images_bt, right_hand_images_bt], dim=1)
         hand_feat = self.hand_backbone(hand_images)
         bt, num_side, feat_dim, feat_height, feat_width = hand_feat.shape
         hand_tokens = hand_feat.permute(0, 1, 3, 4, 2).reshape(bt, num_side, feat_height * feat_width, feat_dim)
 
-        outputs_bt = self.decoder(hand_tokens, body_tokens, camera_param=camera_param_bt)
+        outputs_bt = self.decoder(hand_tokens, body_tokens)
         pose_pred_bt = outputs_bt["pose"]
         transl_pred_bt = outputs_bt["transl"]
 

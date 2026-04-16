@@ -32,7 +32,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 def build_model(args):
     if args.model_version == "1_0":
-        return EgoHands__1_0()
+        return EgoHands__1_0(use_plucker_ray=args.use_plucker_ray)
     else:
         raise ValueError(f"Unsupported model_version: {args.model_version}")
 
@@ -146,7 +146,7 @@ def main():
         checkpoint = torch.load(args.pretrained_path, map_location="cpu")
         # checkpoint = torch.load("/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt", map_location="cpu")
         state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict, strict=not args.use_plucker_ray)
     model.train()
 
     # Enable TF32 for faster training on Ampere GPUs,
