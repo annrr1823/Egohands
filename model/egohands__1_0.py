@@ -129,7 +129,12 @@ class EgoHands(nn.Module):
         bt, num_side, feat_dim, feat_height, feat_width = hand_feat.shape
         hand_tokens = hand_feat.permute(0, 1, 3, 4, 2).reshape(bt, num_side, feat_height * feat_width, feat_dim)
 
-        outputs_bt = self.decoder(hand_tokens, body_tokens)
+        outputs_bt = self.decoder(
+            hand_tokens,
+            body_tokens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
         pose_pred_bt = outputs_bt["pose"]
         transl_pred_bt = outputs_bt["transl"]
 

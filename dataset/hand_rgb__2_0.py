@@ -31,6 +31,8 @@ class HandRGBDataset(Dataset):
         super().__init__()
         self.extra_anno_keys = set(extra_anno_keys) if extra_anno_keys is not None else None
         self.sequence_length = sequence_length
+        # Temporal clips use sparse sampling: e.g. 1,4,7,10 for sequence_length=4.
+        self.sequence_frame_stride = 3
 
         self.image_size = image_size
         self.image_mean = np.array([0.485, 0.456, 0.406])
@@ -137,10 +139,11 @@ class HandRGBDataset(Dataset):
 
         for seq in self.seqs:
             seq_length = seq["length"]
-            if seq_length < self.sequence_length:
+            required_span = 1 + (self.sequence_length - 1) * self.sequence_frame_stride
+            if seq_length < required_span:
                 continue
 
-            max_offset = seq_length - self.sequence_length
+            max_offset = seq_length - required_span
             for offset in range(0, max_offset + 1, self.sequence_length):
                 self.sequence_windows.append({
                     "mode": "temporal",
@@ -150,7 +153,8 @@ class HandRGBDataset(Dataset):
                 })
 
         print(
-            f"[INFO] Built {len(self.sequence_windows)} windows with sequence_length={self.sequence_length}."
+            f"[INFO] Built {len(self.sequence_windows)} windows with sequence_length={self.sequence_length}, "
+            f"sequence_frame_stride={self.sequence_frame_stride}."
         )
     
     def collect_sequences(self) -> List[dict]:
@@ -180,7 +184,8 @@ class HandRGBDataset(Dataset):
         offset = window["offset"]
 
         start = window["seq_start"] + offset
-        clip_frames = self.frames[start:start + self.sequence_length]
+        clip_indices = [start + i * self.sequence_frame_stride for i in range(self.sequence_length)]
+        clip_frames = [self.frames[i] for i in clip_indices]
 
         annos = [self.read_annos(frame) for frame in clip_frames]
         annos = self.convert_sequence_annos_to_canonical(clip_frames, annos)
