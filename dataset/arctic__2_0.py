@@ -197,6 +197,8 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         betas_hands = torch.zeros(2, 10)
         pose_hands = torch.zeros(2, 16, 6)
         transl_hands = torch.zeros(2, 3)
+        global_orient_world_hands = torch.zeros(2, 1, 6)
+        transl_world_hands = torch.zeros(2, 3)
 
         if left_valid:
             left_betas = torch.from_numpy(label['left']['shape'])
@@ -205,6 +207,7 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
             left_global_orient = torch.from_numpy(label['left']['rot'][frame_index])
             left_global_orient = batch_rodrigues(left_global_orient.reshape(1, 3)).view(1, 3, 3)
             left_global_orient = matrix_to_rotation_6d(left_global_orient).view(1, 1, 6)
+            global_orient_world_hands[0] = left_global_orient
 
             left_hand_pose_aa45 = torch.from_numpy(label['left']['pose'][frame_index])
             left_hand_pose = self.mano_lhand.decode_pose_axisangle(left_hand_pose_aa45)
@@ -212,6 +215,7 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
             left_hand_pose = matrix_to_rotation_6d(left_hand_pose).view(1, 15, 6)
 
             left_transl = torch.from_numpy(label['left']['trans'][frame_index]).view(1, 3)
+            transl_world_hands[0] = left_transl
 
             left_wrist_offset = self.mano_lhand(
                 pose_type="rot6d",
@@ -254,6 +258,7 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
             right_global_orient = torch.from_numpy(label['right']['rot'][frame_index])
             right_global_orient = batch_rodrigues(right_global_orient.reshape(1, 3)).view(1, 3, 3)
             right_global_orient = matrix_to_rotation_6d(right_global_orient).view(1, 1, 6)
+            global_orient_world_hands[1] = right_global_orient
 
             right_hand_pose_aa45 = torch.from_numpy(label['right']['pose'][frame_index])
             right_hand_pose = self.mano_rhand.decode_pose_axisangle(right_hand_pose_aa45)
@@ -261,6 +266,7 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
             right_hand_pose = matrix_to_rotation_6d(right_hand_pose).view(1, 15, 6)
 
             right_transl = torch.from_numpy(label['right']['trans'][frame_index]).view(1, 3)
+            transl_world_hands[1] = right_transl
 
             right_wrist_offset = self.mano_rhand(
                 pose_type="rot6d",
@@ -298,6 +304,8 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         anno["pose"] = pose_hands
         anno["transl"] = transl_hands
         anno["joints3d"] = joints3d_hands
+        anno["global_orient_world"] = global_orient_world_hands
+        anno["transl_world"] = transl_world_hands
     
         bbox_hands = torch.zeros(2, 4)
 
@@ -340,9 +348,9 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         extrinsics_4x4[:3, :] = extrinsics.squeeze(0).cpu().numpy()
         return extrinsics_4x4
 
-    def _transform_hand_to_canonical(
+    def _transform_hand_world_to_canonical(
         self,
-        T_curr_to_canonical: np.ndarray,
+        T_world_to_canonical: np.ndarray,
         anno: Dict[str, Any],
         hand_index: int,
     ) -> None:
@@ -352,21 +360,21 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         mano_layer = self.mano_lhand if hand_index == 0 else self.mano_rhand
 
         betas = anno["betas"][hand_index][None, :]
-        global_orient = anno["pose"][hand_index, :1][None]
+        global_orient_world = anno["global_orient_world"][hand_index][None]
         hand_pose = anno["pose"][hand_index, 1:][None]
-        transl = anno["transl"][hand_index][None]
+        transl_world = anno["transl_world"][hand_index][None]
 
         wrist_offset = mano_layer(
             pose_type="rot6d",
             betas=betas,
-            global_orient=global_orient,
+            global_orient=global_orient_world,
             hand_pose=hand_pose,
         )["joints"][..., 0, :]
 
         global_orient_canonical, transl_canonical = transfer_mano_params_A_to_B(
-            T_curr_to_canonical,
-            global_orient.numpy(),
-            transl.numpy(),
+            T_world_to_canonical,
+            global_orient_world.numpy(),
+            transl_world.numpy(),
             wrist_offset.numpy(),
         )
         global_orient_canonical = torch.from_numpy(global_orient_canonical).reshape(1, 1, 6)
@@ -394,17 +402,19 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         if len(annos) == 0:
             return annos
 
-        first_extrinsics = self._build_extrinsics_4x4(annos[0]["extrinsics"])
-        T_world_to_canonical = np.linalg.inv(first_extrinsics)
+        T_canonical_to_world = self._build_extrinsics_4x4(annos[0]["extrinsics"])
+        T_world_to_canonical = np.linalg.inv(T_canonical_to_world)
 
         for anno in annos:
             curr_extrinsics = self._build_extrinsics_4x4(anno["extrinsics"])
             T_curr_to_canonical = T_world_to_canonical @ curr_extrinsics
 
-            self._transform_hand_to_canonical(T_curr_to_canonical, anno, hand_index=0)
-            self._transform_hand_to_canonical(T_curr_to_canonical, anno, hand_index=1)
+            self._transform_hand_world_to_canonical(T_world_to_canonical, anno, hand_index=0)
+            self._transform_hand_world_to_canonical(T_world_to_canonical, anno, hand_index=1)
 
             anno["extrinsics"] = torch.from_numpy(T_curr_to_canonical[:3, :]).reshape(1, 3, 4)
+            anno.pop("global_orient_world", None)
+            anno.pop("transl_world", None)
 
         return annos
 

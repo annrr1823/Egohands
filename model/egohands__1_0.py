@@ -30,20 +30,32 @@ class EgoHands(nn.Module):
             freeze_params=True,
         )
 
-        self.decoder = BaseDecoder(
-            input_dim=1280,
-        )
+        body_context_dim = self.body_backbone.embed_dim
 
         if self.use_plucker_ray:
+            patch_size = self.body_backbone.patch_size
+            if isinstance(patch_size, tuple):
+                plucker_in_dim = 6 * patch_size[0] * patch_size[1]
+            else:
+                plucker_in_dim = 6 * patch_size * patch_size
+
             self.plucker_ray = PluckerRayEmbedding(
                 image_size=(512, 512),
-                patch_size=self.body_backbone.patch_size,
+                patch_size=patch_size,
             )
             self.plucker_proj = nn.Sequential(
-                nn.Linear(6, self.body_backbone.embed_dim),
+                nn.Linear(plucker_in_dim, self.body_backbone.embed_dim),
                 nn.LayerNorm(self.body_backbone.embed_dim),
             )
-            self.plucker_alpha = nn.Parameter(torch.tensor(1.0))
+            self.body_plucker_fuse = nn.Sequential(
+                nn.Linear(self.body_backbone.embed_dim * 2, self.body_backbone.embed_dim),
+                nn.LayerNorm(self.body_backbone.embed_dim),
+            )
+
+        self.decoder = BaseDecoder(
+            input_dim=body_context_dim,
+        )
+
 
         self.mano_lhand = MANOLayer(model_path=MANO_PATH, is_rhand=False)
         self.mano_rhand = MANOLayer(model_path=MANO_PATH, is_rhand=True)
@@ -58,7 +70,7 @@ class EgoHands(nn.Module):
         if x.dim() == 4:
             return x.unsqueeze(1), False
         return x, True
-
+    
     def _build_plucker_tokens(self, batch, batch_size, seq_len, device, dtype):
         extrinsics = batch["extrinsics"].to(device=device, dtype=dtype)
         intrinsics = batch.get("intrinsics_resize", batch["intrinsics"]).to(device=device, dtype=dtype)
@@ -79,11 +91,11 @@ class EgoHands(nn.Module):
         extrinsics_4x4 = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4).expand(batch_size, seq_len, 4, 4).clone()
         extrinsics_4x4[..., :3, :] = extrinsics
 
-        plucker_tokens = self.plucker_ray.compute_patch_center_plucker(
+        plucker_tokens = self.plucker_ray(
             extrinsics=extrinsics_4x4,
             intrinsics=intrinsics,
         )
-        plucker_tokens = plucker_tokens.reshape(batch_size * seq_len, plucker_tokens.shape[2], 6)
+        plucker_tokens = plucker_tokens.reshape(batch_size * seq_len, plucker_tokens.shape[2], plucker_tokens.shape[3])
         plucker_tokens = self.plucker_proj(plucker_tokens)
 
         return plucker_tokens
@@ -122,7 +134,9 @@ class EgoHands(nn.Module):
                 device=body_tokens.device,
                 dtype=body_tokens.dtype,
             )
-            body_tokens = body_tokens + self.plucker_alpha * plucker_tokens
+            # Concatenate first, then fuse back to decoder context dimension.
+            body_tokens = torch.cat([body_tokens, plucker_tokens], dim=-1)
+            body_tokens = self.body_plucker_fuse(body_tokens)
 
         hand_images = torch.stack([left_hand_images_bt, right_hand_images_bt], dim=1)
         hand_feat = self.hand_backbone(hand_images)
@@ -295,5 +309,3 @@ class EgoHands(nn.Module):
             self.hand_backbone.eval()
             
         return self
-
-

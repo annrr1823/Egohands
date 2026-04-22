@@ -26,14 +26,16 @@ from dataset.h2o__1_0 import H2OEgoRGBDataset as H2OEgoRGBDataset__1_0
 from model.egohands__1_0 import EgoHands as EgoHands__1_0
 
 
+
 # python /data/sunzhihao2/turuirui/egohands/experiment/demo/infer_arctic.py \
-#   --checkpoint_path /data/sunzhihao2/turuirui/egohands/experiment/ckpt/v__4_0__arctic_1_0/best_mpjpe.pth \
-#   --output_dir /data/sunzhihao2/turuirui/arctic_pipeline/outputs/egohands_3 \
+#   --checkpoint_path /data/sunzhihao2/turuirui/egohands/experiment/ckpt/v__5_0__arctic_1_0/best_mpjpe.pth \
+#   --output_dir /data/sunzhihao2/turuirui/arctic_pipeline/outputs/egohands_4 \
 #   --dataset_name arctic \
 #   --split val \
 #   --batch_size 16 \
 #   --device cuda \
-#   --save_summary
+#   --save_summary \
+#   --canonical_to_current_camera on \
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run EgoHands on ARCTIC and export evalable predictions.")
@@ -120,6 +122,16 @@ def parse_args():
         "--save_summary",
         action="store_true",
         help="Save a small summary.json alongside the predictions.",
+    )
+    parser.add_argument(
+        "--canonical_to_current_camera",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help=(
+            "Convert predicted 3D joints from canonical(first-frame camera) coordinates "
+            "to each frame's camera coordinates. "
+        ),
     )
 
     return parser.parse_args()
@@ -241,6 +253,43 @@ def ensure_temporal_outputs(outputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
     return pose_pred, transl_pred
 
 
+def ensure_temporal_extrinsics(extrinsics: torch.Tensor) -> torch.Tensor:
+    """Normalize extrinsics shape to [B, T, 4, 4]."""
+    if extrinsics.dim() == 4:
+        extrinsics = extrinsics.unsqueeze(1)
+    if extrinsics.dim() == 5 and extrinsics.shape[2] == 1:
+        extrinsics = extrinsics.squeeze(2)
+
+    if extrinsics.dim() != 4 or tuple(extrinsics.shape[-2:]) != (3, 4):
+        raise ValueError(f"Unexpected extrinsics shape: {tuple(extrinsics.shape)}")
+
+    batch_size, seq_len = extrinsics.shape[:2]
+    extrinsics_4x4 = torch.eye(
+        4,
+        dtype=extrinsics.dtype,
+        device=extrinsics.device,
+    ).view(1, 1, 4, 4).expand(batch_size, seq_len, 4, 4).clone()
+    extrinsics_4x4[..., :3, :] = extrinsics
+    return extrinsics_4x4
+
+
+def transform_kp3d_with_4x4(kp3d_pred: np.ndarray, transform_4x4: np.ndarray) -> np.ndarray:
+    """Apply a rigid transform to valid joints; keep all-invalid joints as -1."""
+    out = kp3d_pred.copy()
+    valid_mask = ~np.all(out == -1.0, axis=1)
+    if not np.any(valid_mask):
+        return out
+
+    points = out[valid_mask]
+    points_homo = np.concatenate(
+        [points, np.ones((points.shape[0], 1), dtype=points.dtype)],
+        axis=1,
+    )
+    points_transformed = (transform_4x4 @ points_homo.T).T[:, :3]
+    out[valid_mask] = points_transformed.astype(np.float32)
+    return out
+
+
 def get_meta_frame_path(meta: dict, time_index: int) -> str:
     frame_ids = meta.get("frame_ids")
     if isinstance(frame_ids, list):
@@ -248,28 +297,43 @@ def get_meta_frame_path(meta: dict, time_index: int) -> str:
     return str(meta.get("frame_id", ""))
 
 
-def build_eval_kp3d_pred(model, pose_pred: torch.Tensor, transl_pred: torch.Tensor, hand_side_mask: torch.Tensor, betas: torch.Tensor) -> np.ndarray:
+def build_eval_kp3d_pred(
+    model,
+    pose_pred: torch.Tensor,
+    transl_pred: torch.Tensor,
+    hand_side_mask: torch.Tensor,
+    betas: torch.Tensor,
+) -> np.ndarray:
     # ARCTIC eval expects full-camera MANO joints in [left(21), right(21)] order.
-    # If a future model emits crop-space translation, the crop->full recovery belongs here.
+    # If predictions are in canonical space, convert decoded joints with a rigid
+    # transform outside this function.
     kp3d_pred = np.full((42, 3), -1.0, dtype=np.float32)
 
     if hand_side_mask[0] > 0:
+        left_global_orient = pose_pred[0:1, :1]
+        left_hand_pose = pose_pred[0:1, 1:]
+        left_transl = transl_pred[0:1]
+
         left_output = model.mano_lhand(
             pose_type="rot6d",
             betas=betas[0:1],
-            global_orient=pose_pred[0:1, :1],
-            hand_pose=pose_pred[0:1, 1:],
-            transl=transl_pred[0:1],
+            global_orient=left_global_orient,
+            hand_pose=left_hand_pose,
+            transl=left_transl,
         )
         kp3d_pred[:21] = left_output["joints"][0].detach().cpu().numpy().astype(np.float32)
 
     if hand_side_mask[1] > 0:
+        right_global_orient = pose_pred[1:2, :1]
+        right_hand_pose = pose_pred[1:2, 1:]
+        right_transl = transl_pred[1:2]
+
         right_output = model.mano_rhand(
             pose_type="rot6d",
             betas=betas[1:2],
-            global_orient=pose_pred[1:2, :1],
-            hand_pose=pose_pred[1:2, 1:],
-            transl=transl_pred[1:2],
+            global_orient=right_global_orient,
+            hand_pose=right_hand_pose,
+            transl=right_transl,
         )
         kp3d_pred[21:] = right_output["joints"][0].detach().cpu().numpy().astype(np.float32)
 
@@ -278,6 +342,7 @@ def build_eval_kp3d_pred(model, pose_pred: torch.Tensor, transl_pred: torch.Tens
 
 def main():
     args = parse_args()
+    apply_canonical_to_current = args.canonical_to_current_camera == "on"
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +402,8 @@ def main():
             batch_size = batch["image"].shape[0]
             batch_device = batch_to_device(batch, device)
 
+            extrinsics_seq = ensure_temporal_extrinsics(batch["extrinsics"]).detach().cpu().numpy()
+
             with autocast_ctx():
                 _, _, outputs = model(batch_device, weight_dtype=weight_dtype)
 
@@ -370,11 +437,19 @@ def main():
                         betas=batch_device["betas"][i, t],
                     )
 
+                    if apply_canonical_to_current:
+                        # For ARCTIC 2_0 sequence training, extrinsics are T_curr_to_canonical.
+                        # We need T_canonical_to_curr for eval outputs in each frame camera coordinates.
+                        t_curr_to_canonical = extrinsics_seq[i, t].astype(np.float32)
+                        t_canonical_to_curr = np.linalg.inv(t_curr_to_canonical).astype(np.float32)
+                        kp3d_pred = transform_kp3d_with_4x4(kp3d_pred, t_canonical_to_curr)
+
                     extra = {
                         "pose_pred": pose_pred[i, t].astype(np.float32),
                         "transl_pred": transl_pred[i, t].astype(np.float32),
                         "hand_side_mask": hand_side_mask[i, t].astype(np.float32),
-                        "coord_semantics": "camera",
+                        "coord_semantics": "camera_current_frame" if apply_canonical_to_current else "camera_canonical_first_frame",
+                        "canonical_to_current_camera_applied": bool(apply_canonical_to_current),
                         "joint_order": "openpose",
                         "seq_id": str(meta.get("seq_id", "")),
                         "frame_id": str(image_path),
@@ -400,6 +475,8 @@ def main():
         "num_samples_processed": total_samples,
         "num_files_saved": saved_files,
         "num_files_skipped": skipped_files,
+        "canonical_to_current_camera": args.canonical_to_current_camera,
+        "canonical_to_current_camera_applied": bool(apply_canonical_to_current),
         "note": "Run /data/turuirui/arctic_pipeline/evaluation/eval.py on this output_dir for ARCTIC metrics.",
     }
 
