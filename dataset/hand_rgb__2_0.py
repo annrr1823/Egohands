@@ -27,10 +27,14 @@ class HandRGBDataset(Dataset):
         extra_anno_keys: Sequence[Literal["extrinsics"]] = [],
         sequence_length: int = 1,
         seed: Optional[int] = None,
+        camera_source: Literal["auto", "cache_only", "gt_only"] = "auto",
     ):
         super().__init__()
         self.extra_anno_keys = set(extra_anno_keys) if extra_anno_keys is not None else None
         self.sequence_length = sequence_length
+        if camera_source not in {"auto", "cache_only", "gt_only"}:
+            raise ValueError(f"Unsupported camera_source: {camera_source}")
+        self.camera_source = camera_source
         # Temporal clips use sparse sampling: e.g. 1,4,7,10 for sequence_length=4.
         self.sequence_frame_stride = 3
 
@@ -55,6 +59,86 @@ class HandRGBDataset(Dataset):
 
         if len(self.sequence_windows) == 0:
             raise ValueError("No valid sequence windows found.")
+
+    def _frame_cache_key(self, frame: Dict[str, Any]) -> str:
+        frame_id = frame.get("frame_id", None)
+        return str(frame_id)
+
+    def _load_camera_cache(self, cache_file: Optional[Union[str, Path]]) -> Dict[str, Dict[str, Any]]:
+        if cache_file is None:
+            return {}
+
+        cache_path = Path(cache_file)
+        if not cache_path.exists():
+            return {}
+
+        with open(cache_path, "rb") as f:
+            cache_data = pickle.load(f)
+
+        if isinstance(cache_data, dict) and "records" in cache_data:
+            records = cache_data["records"]
+        elif isinstance(cache_data, dict):
+            records = cache_data
+        else:
+            raise TypeError(
+                f"Unexpected camera cache format in {cache_path}: expected dict, got {type(cache_data)!r}."
+            )
+
+        return records
+
+    def _to_camera_tensor(self, value: Any, shape: Tuple[int, ...]) -> torch.Tensor:
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+        return tensor.reshape(*shape)
+
+    def _resolve_camera_record(self, camera_record: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        intrinsics = self._to_camera_tensor(camera_record["intrinsics"], (1, 4))
+        extrinsics = self._to_camera_tensor(camera_record["extrinsics"], (1, 3, 4))
+
+        return {
+            "intrinsics": intrinsics,
+            "extrinsics": extrinsics,
+        }
+    
+    def _compute_intrinsics_resize(self, intrinsics: torch.Tensor) -> torch.Tensor:
+        """计算resize后的内参数。
+        
+        Args:
+            intrinsics: 原始内参数，shape (1, 4)
+        
+        Returns:
+            resize后的内参数，shape (1, 4)
+        """
+        fx, fy, cx, cy = intrinsics.view(-1)
+        intrinsics_resize = torch.tensor(
+            [
+                fx * self.resize_scale[0],
+                fy * self.resize_scale[1],
+                cx * self.resize_scale[0],
+                cy * self.resize_scale[1],
+            ],
+            dtype=torch.float32,
+        ).reshape(1, 4)
+        return intrinsics_resize
+
+    def get_cached_camera_record(self, frame: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
+        camera_cache = getattr(self, "camera_cache", None)
+        if not camera_cache:
+            return None
+
+        cache_key = self._frame_cache_key(frame)
+        camera_record = camera_cache.get(cache_key)
+        if camera_record is None:
+            return None
+
+        return self._resolve_camera_record(camera_record)
+
+    def has_cached_camera_record(self, frame: Dict[str, Any]) -> bool:
+        camera_cache = getattr(self, "camera_cache", None)
+        if not camera_cache:
+            return False
+
+        cache_key = self._frame_cache_key(frame)
+        return cache_key in camera_cache
         
     def load_metadata(self):
         """
@@ -189,14 +273,39 @@ class HandRGBDataset(Dataset):
 
         annos = [self.read_annos(frame) for frame in clip_frames]
         annos = self.convert_sequence_annos_to_canonical(clip_frames, annos)
+
+        # Ensure both GT and cached (predicted) camera records are available in annos.
+        for i, frame in enumerate(clip_frames):
+            anno = annos[i]
+            # store GT copies
+            anno["intrinsics_gt"] = anno.get("intrinsics")
+            anno["intrinsics_resize_gt"] = anno.get("intrinsics_resize")
+            anno["extrinsics_gt"] = anno.get("extrinsics") if "extrinsics" in anno else None
+
+            cached = self.get_cached_camera_record(frame)
+            if cached is not None:
+                anno["intrinsics_cache"] = cached["intrinsics"]
+                # compute resized intrinsics for cached camera
+                anno["intrinsics_resize_cache"] = self._compute_intrinsics_resize(cached["intrinsics"]) if cached.get("intrinsics") is not None else anno["intrinsics_resize_gt"]
+                anno["extrinsics_cache"] = cached["extrinsics"]
+            else:
+                # fallback to GT when cache is missing
+                anno["intrinsics_cache"] = anno.get("intrinsics")
+                anno["intrinsics_resize_cache"] = anno.get("intrinsics_resize")
+                anno["extrinsics_cache"] = anno.get("extrinsics")
         image_dicts = [self.read_image(frame, anno) for frame, anno in zip(clip_frames, annos)]
 
         hand_side = torch.tensor([anno["hand_side"] for anno in annos], dtype=torch.long)
         hand_side_mask = torch.stack([anno["hand_side_mask"] for anno in annos], dim=0)
+        mano_side_mask = torch.stack(
+            [anno.get("mano_side_mask", anno["hand_side_mask"]) for anno in annos],
+            dim=0,
+        )
 
         sample = {
             "hand_side": hand_side,
             "hand_side_mask": hand_side_mask,
+            "mano_side_mask": mano_side_mask,
             "object": annos[0]["object"],
             "image": torch.stack([img["image"] for img in image_dicts], dim=0),
             "left_hand_image": torch.stack([img["left_hand_image"] for img in image_dicts], dim=0),
@@ -210,6 +319,13 @@ class HandRGBDataset(Dataset):
             "intrinsics": torch.stack([anno["intrinsics"] for anno in annos], dim=0),
             "intrinsics_resize": torch.stack([anno["intrinsics_resize"] for anno in annos], dim=0),
             "extrinsics": torch.stack([anno["extrinsics"] for anno in annos], dim=0),
+            # GT / cached camera records for student/teacher flexibility
+            "intrinsics_gt": torch.stack([anno["intrinsics_gt"] for anno in annos], dim=0),
+            "intrinsics_resize_gt": torch.stack([anno["intrinsics_resize_gt"] for anno in annos], dim=0),
+            "extrinsics_gt": torch.stack([anno.get("extrinsics_gt") if anno.get("extrinsics_gt") is not None else anno.get("extrinsics") for anno in annos], dim=0),
+            "intrinsics_cache": torch.stack([anno["intrinsics_cache"] for anno in annos], dim=0),
+            "intrinsics_resize_cache": torch.stack([anno["intrinsics_resize_cache"] for anno in annos], dim=0),
+            "extrinsics_cache": torch.stack([anno.get("extrinsics_cache") if anno.get("extrinsics_cache") is not None else anno.get("extrinsics") for anno in annos], dim=0),
             "meta": {
                 "index": idx,
                 "seq_id": clip_frames[0].get("seq_id", None),
@@ -224,7 +340,20 @@ class HandRGBDataset(Dataset):
     def _build_single_sample(self, frame: Dict[str, Any], index: int) -> Dict[str, Any]:
         anno = self.read_annos(frame)
         image_dict = self.read_image(frame, anno)
+        # provide both GT and cached camera records on single-frame samples as well
+        anno["intrinsics_gt"] = anno.get("intrinsics")
+        anno["intrinsics_resize_gt"] = anno.get("intrinsics_resize")
+        anno["extrinsics_gt"] = anno.get("extrinsics")
 
+        cached = self.get_cached_camera_record(frame)
+        if cached is not None:
+            anno["intrinsics_cache"] = cached["intrinsics"]
+            anno["intrinsics_resize_cache"] = self._compute_intrinsics_resize(cached["intrinsics"]) if cached.get("intrinsics") is not None else anno.get("intrinsics_resize")
+            anno["extrinsics_cache"] = cached["extrinsics"]
+        else:
+            anno["intrinsics_cache"] = anno.get("intrinsics")
+            anno["intrinsics_resize_cache"] = anno.get("intrinsics_resize")
+            anno["extrinsics_cache"] = anno.get("extrinsics")
         frame_meta = {
             "frame_id": frame.get("frame_id", None),
             "seq_id": frame.get("seq_id", None),
@@ -234,6 +363,7 @@ class HandRGBDataset(Dataset):
         sample = {
             "hand_side": anno["hand_side"],
             "hand_side_mask": anno["hand_side_mask"],
+            "mano_side_mask": anno.get("mano_side_mask", anno["hand_side_mask"]),
             "object": anno["object"],
             "image": image_dict["image"],
             "left_hand_image": image_dict["left_hand_image"],
@@ -247,6 +377,13 @@ class HandRGBDataset(Dataset):
             "intrinsics": anno["intrinsics"],
             "intrinsics_resize": anno["intrinsics_resize"],
             "extrinsics": anno["extrinsics"],
+            # GT / cached camera records
+            "intrinsics_gt": anno["intrinsics_gt"],
+            "intrinsics_resize_gt": anno["intrinsics_resize_gt"],
+            "extrinsics_gt": anno.get("extrinsics_gt"),
+            "intrinsics_cache": anno["intrinsics_cache"],
+            "intrinsics_resize_cache": anno["intrinsics_resize_cache"],
+            "extrinsics_cache": anno.get("extrinsics_cache"),
             "meta": {
                 "index": index,
                 **frame_meta,

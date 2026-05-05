@@ -100,7 +100,7 @@ class EgoHands(nn.Module):
 
         return plucker_tokens
 
-    def forward(self, batch, weight_dtype):
+    def forward(self, batch, weight_dtype, return_intermediate=False):
         images = batch["image"].to(weight_dtype)
         left_hand_images = batch["left_hand_image"].to(weight_dtype)
         right_hand_images = batch["right_hand_image"].to(weight_dtype)
@@ -148,9 +148,11 @@ class EgoHands(nn.Module):
             body_tokens,
             batch_size=batch_size,
             seq_len=seq_len,
+            return_intermediate=return_intermediate,
         )
         pose_pred_bt = outputs_bt["pose"]
         transl_pred_bt = outputs_bt["transl"]
+        mano_tokens_bt = outputs_bt.get("mano_tokens")
 
         mano_outputs_left = self.mano_lhand(
             pose_type="rot6d",
@@ -180,12 +182,24 @@ class EgoHands(nn.Module):
             pose_pred = pose_pred[:, 0]
             transl_pred = transl_pred[:, 0]
             joints3d_pred = joints3d_pred[:, 0]
+            if mano_tokens_bt is not None:
+                mano_tokens = mano_tokens_bt
+        else:
+            if mano_tokens_bt is not None:
+                mano_tokens = mano_tokens_bt.reshape(batch_size, seq_len, *mano_tokens_bt.shape[1:])
 
         outputs = {
             "pose": pose_pred,
             "transl": transl_pred,
             "joints3d": joints3d_pred,
         }
+
+        # Add intermediate features for knowledge distillation
+        if return_intermediate:
+            outputs["body_tokens"] = body_tokens
+            outputs["hand_tokens"] = hand_tokens
+            if mano_tokens_bt is not None:
+                outputs["mano_tokens"] = mano_tokens if has_temporal else mano_tokens_bt
 
         losses = self.compute_loss(outputs, batch, weight_dtype)
         metrics = self.compute_metric(outputs, batch, weight_dtype)
@@ -199,6 +213,7 @@ class EgoHands(nn.Module):
         joints3d = batch["joints3d"].to(weight_dtype)
 
         hand_side_mask = batch["hand_side_mask"].to(weight_dtype)
+        mano_side_mask = batch.get("mano_side_mask", batch["hand_side_mask"]).to(weight_dtype)
 
         pose_pred = outputs["pose"]
         transl_pred = outputs["transl"]
@@ -206,11 +221,11 @@ class EgoHands(nn.Module):
         
         pose_loss = F.l1_loss(pose_pred, pose, reduction="none")
         pose_loss= pose_loss.mean(dim=-1).mean(dim=-1)
-        pose_loss = (pose_loss * hand_side_mask).sum() / (hand_side_mask.sum() + eps)
+        pose_loss = (pose_loss * mano_side_mask).sum() / (mano_side_mask.sum() + eps)
 
         transl_loss = F.l1_loss(transl_pred, transl, reduction="none")
         transl_loss= transl_loss.mean(dim=-1)
-        transl_loss = (transl_loss * hand_side_mask).sum() / (hand_side_mask.sum() + eps)
+        transl_loss = (transl_loss * mano_side_mask).sum() / (mano_side_mask.sum() + eps)
 
         joints3d_loss = F.l1_loss(joints3d_pred, joints3d, reduction="none")
         joints3d_loss= joints3d_loss.mean(dim=-1).mean(dim=-1)

@@ -32,17 +32,25 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         split: Literal["train", "val", "test"] = "train",
         setup: Literal["p1", "p2"] = "p1",
         sequence_length: int = 8,
+        camera_cache_file=None,
+        camera_source: Literal["auto", "cache_only", "gt_only"] = "auto",
         **kwargs,
     ):
         self.dataset_folder = dataset_folder
         self.split = split
         self.setup = setup
         self.sequence_length = sequence_length
+        self.camera_cache_file = camera_cache_file
+        self.camera_source = camera_source
 
         self.raw_image_size = (2800, 2000)
 
         self.cache_dir = Path(__file__).parent.parent / "_DATA"
-        self.sequence_cache_file = self.cache_dir / "sequences_cache" / f"arctic_{setup}_{split}.pkl"
+        if camera_source == "auto":
+            self.sequence_cache_file = self.cache_dir / "sequences_cache" / f"arctic_{setup}_{split}.pkl"
+        else:
+            self.sequence_cache_file = self.cache_dir / "sequences_cache" / f"arctic_{setup}_{split}_{camera_source}.pkl"
+        self.camera_cache = self._load_camera_cache(self.camera_cache_file)
 
         print(f"[INFO] Loading ARCTIC dataset with setup {setup}-{split}.")
 
@@ -58,7 +66,7 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         with open(misc_path, "r") as f:
             self.misc_meta = json.load(f)
         
-        super().__init__(sequence_length=sequence_length, **kwargs)
+        super().__init__(sequence_length=sequence_length, camera_source=camera_source, **kwargs)
     
     def collect_sequences(self) -> List[dict]:
         """
@@ -118,6 +126,13 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
                     if left_valid_frame or right_valid_frame:
                         frame_ids.append(os.path.join(frame_folder, f"{frame_id}.jpg"))
 
+                if self.camera_source == "cache_only":
+                    if len(frame_ids) == 0:
+                        continue
+
+                    if not all(self.has_cached_camera_record({"frame_id": frame_id}) for frame_id in frame_ids):
+                        continue
+
                 sequences.append({"seq_id": f"{subject}/{seq_id}", "frame_ids": frame_ids})
 
         return sequences
@@ -164,31 +179,47 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
 
         anno["object"] = seq_id
 
-        # Load camera params.
-        egocam_meta = np.load(egocam_path, allow_pickle=True).item()
+        cached_camera = self.get_cached_camera_record(frame)
+        use_cached_camera = cached_camera is not None and self.camera_source in {"auto", "cache_only"}
 
-        intrinsics = egocam_meta['intrinsics']
-        fx = intrinsics[0][0]
-        fy = intrinsics[1][1]
-        cx = intrinsics[0][2]
-        cy = intrinsics[1][2]
+        if use_cached_camera:
+            intrinsics = cached_camera["intrinsics"]
+            anno["intrinsics"] = intrinsics
+            anno["intrinsics_resize"] = self._compute_intrinsics_resize(intrinsics)
+            extrinsics = cached_camera["extrinsics"]
+            anno["extrinsics"] = extrinsics
+            T_camera_to_world = np.eye(4, dtype=np.float32)
+            T_camera_to_world[:3, :] = extrinsics.squeeze(0).numpy()
+            T_world_to_camera = np.linalg.inv(T_camera_to_world)
+        else:
+            if self.camera_source == "cache_only":
+                raise KeyError(f"Camera cache not found for frame {frame_id} while camera_source='cache_only'.")
 
-        fx_resize = fx * self.resize_scale[0]
-        fy_resize = fy * self.resize_scale[1]
-        cx_resize = cx * self.resize_scale[0]
-        cy_resize = cy * self.resize_scale[1]
+            # Load camera params.
+            egocam_meta = np.load(egocam_path, allow_pickle=True).item()
 
-        anno["intrinsics"] = torch.asarray([fx, fy, cx, cy]).reshape(1, 4)
-        anno["intrinsics_resize"] = torch.asarray([fx_resize, fy_resize, cx_resize, cy_resize]).reshape(1, 4)
+            intrinsics = egocam_meta['intrinsics']
+            fx = intrinsics[0][0]
+            fy = intrinsics[1][1]
+            cx = intrinsics[0][2]
+            cy = intrinsics[1][2]
 
-        R = egocam_meta["R_k_cam_np"][frame_index]
-        t = egocam_meta["T_k_cam_np"][frame_index]
+            fx_resize = fx * self.resize_scale[0]
+            fy_resize = fy * self.resize_scale[1]
+            cx_resize = cx * self.resize_scale[0]
+            cy_resize = cy * self.resize_scale[1]
 
-        T_world_to_camera = unify_transfer_matrix(rotation_matrix=R, translation_xyz=t[:, 0])
-        T_camera_to_world = np.linalg.inv(T_world_to_camera)
+            anno["intrinsics"] = torch.asarray([fx, fy, cx, cy]).reshape(1, 4)
+            anno["intrinsics_resize"] = torch.asarray([fx_resize, fy_resize, cx_resize, cy_resize]).reshape(1, 4)
 
-        extrinsics = torch.asarray(T_camera_to_world[:3, :]).reshape(1, 3, 4)
-        anno["extrinsics"] = extrinsics
+            R = egocam_meta["R_k_cam_np"][frame_index]
+            t = egocam_meta["T_k_cam_np"][frame_index]
+
+            T_world_to_camera = unify_transfer_matrix(rotation_matrix=R, translation_xyz=t[:, 0])
+            T_camera_to_world = np.linalg.inv(T_world_to_camera)
+
+            extrinsics = torch.asarray(T_camera_to_world[:3, :]).reshape(1, 3, 4)
+            anno["extrinsics"] = extrinsics
 
         # Load hand pose params.
         label = np.load(label_path, allow_pickle=True).item()

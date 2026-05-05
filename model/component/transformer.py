@@ -370,29 +370,54 @@ class DecoderLayerDoubleCrossAttn(nn.Module):
         norm: str = "layer",
         norm_cond_dim: int = -1,
         context_dim: Optional[int] = None,
+        max_temporal_len: int = 32,
     ):
         super().__init__()
+        self.temporal_pos_embedding = nn.Parameter(
+            torch.randn(1, max_temporal_len, dim) * 0.02
+        )
+        self.temporal_alpha = nn.Parameter(torch.tensor(1.0))
+
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             sa = SelfAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+            t_sa = SelfAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
             ca1 = CrossAttention(dim, context_dim=context_dim, heads=heads, dim_head=dim_head, dropout=dropout)
             ca2 = CrossAttention(dim, context_dim=context_dim, heads=heads, dim_head=dim_head, dropout=dropout)
             ff = FeedForward(dim, mlp_dim, dropout=dropout)
 
-            self.layers.append(
-                nn.ModuleList(
-                    [
-                        PreNorm(dim, sa, norm=norm, norm_cond_dim=norm_cond_dim),
-                        PreNorm(dim, ca1, norm=norm, norm_cond_dim=norm_cond_dim),
-                        PreNorm(dim, ca2, norm=norm, norm_cond_dim=norm_cond_dim),
-                        PreNorm(dim, ff, norm=norm, norm_cond_dim=norm_cond_dim),
-                    ]
-                )
-            )
+            mods = [
+                PreNorm(dim, sa,  norm=norm, norm_cond_dim=norm_cond_dim),
+                PreNorm(dim, t_sa, norm=norm, norm_cond_dim=norm_cond_dim),
+                PreNorm(dim, ca1, norm=norm, norm_cond_dim=norm_cond_dim),
+                PreNorm(dim, ca2, norm=norm, norm_cond_dim=norm_cond_dim),
+                PreNorm(dim, ff,  norm=norm, norm_cond_dim=norm_cond_dim),
+            ]
+            self.layers.append(nn.ModuleList([m for m in mods if m is not None]))
 
-    def forward(self, x, context1, context2, context1_mask=None, context2_mask=None):
-        for i, (sa, ca1, ca2, ff) in enumerate(self.layers):
+    def _temporal_sa(self, x, t_sa, batch_size, seq_len):
+        """
+        x: (B*T, N, D)  →  reshape to (B*N, T, D)  →  SA  →  reshape back
+        """
+        BT, N, D = x.shape
+        # add temporal positional embedding
+        pos = self.temporal_pos_embedding[:, :seq_len]          # (1, T, D)
+        x_t = x.reshape(batch_size, seq_len, N, D)
+        x_t = x_t + pos.unsqueeze(2)                            # broadcast over N
+        x_t = x_t.permute(0, 2, 1, 3).reshape(batch_size * N, seq_len, D)
+
+        residual = x_t
+        x_t = t_sa(x_t)
+        x_t = residual + self.temporal_alpha * x_t
+
+        x_t = x_t.reshape(batch_size, N, seq_len, D).permute(0, 2, 1, 3)
+        return x_t.reshape(BT, N, D)
+
+    def forward(self, x, context1, context2, context1_mask=None, context2_mask=None,batch_size=None,seq_len=None):
+        # layers list: [sa_prenorm, t_sa_prenorm, ca1_prenorm, ca2_prenorm, ff_prenorm]
+        for sa, t_sa, ca1, ca2, ff in self.layers:
             x = sa(x) + x
+            x = self._temporal_sa(x, t_sa, batch_size, seq_len)
             x = ca1(x, context=context1, context_mask=context1_mask) + x
             x = ca2(x, context=context2, context_mask=context2_mask) + x
             x = ff(x) + x
@@ -503,6 +528,7 @@ class DecoderDoubleCrossAttn(nn.Module):
         norm: str = "layer",
         norm_cond_dim: int = -1,
         context_dim: Optional[int] = None,
+        max_temporal_len: int = 32,
     ):
         super().__init__()
 
@@ -524,9 +550,10 @@ class DecoderDoubleCrossAttn(nn.Module):
             norm=norm,
             norm_cond_dim=norm_cond_dim,
             context_dim=context_dim,
+            max_temporal_len=max_temporal_len,
         )
 
-    def forward(self, x, context1, context2, context1_mask=None, context2_mask=None):
+    def forward(self, x, context1, context2, context1_mask=None, context2_mask=None,batch_size=None,seq_len=None):
         b, n, _ = x.shape
 
         x = self.dropout(x)
@@ -538,5 +565,7 @@ class DecoderDoubleCrossAttn(nn.Module):
             context2=context2,
             context1_mask=context1_mask,
             context2_mask=context2_mask,
+            batch_size=batch_size,
+            seq_len=seq_len,
         )
         return x

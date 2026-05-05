@@ -91,9 +91,56 @@ def parse_args_training():
         "--pretrained_path",
         type=str,
         default=None,
-        # default="/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt",
         required=False,
         help="Path to pretrained model.",
+    )
+    parser.add_argument(
+        "--teacher_pretrained_path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to teacher checkpoint used for distillation.",
+    )
+    parser.add_argument(
+        "--teacher_use_plucker_ray",
+        action="store_true",
+        help="Use Plucker ray in teacher model. If not set, teacher follows --use_plucker_ray.",
+    )
+    parser.add_argument(
+        "--distill_weight",
+        type=float,
+        default=0.0,
+        help="Global weight for teacher-student distillation loss.",
+    )
+    parser.add_argument(
+        "--distill_weight_pose",
+        type=float,
+        default=1.0,
+        help="Relative weight of pose distillation term.",
+    )
+    parser.add_argument(
+        "--distill_weight_transl",
+        type=float,
+        default=1.0,
+        help="Relative weight of translation distillation term.",
+    )
+    parser.add_argument(
+        "--distill_weight_joints3d",
+        type=float,
+        default=1.0,
+        help="Relative weight of 3D joints distillation term.",
+    )
+    parser.add_argument(
+        "--distill_weight_body_token",
+        type=float,
+        default=0.5,
+        help="Weight for body token feature distillation loss.",
+    )
+    parser.add_argument(
+        "--distill_weight_hand_token",
+        type=float,
+        default=0.5,
+        help="Weight for hand token feature distillation loss.",
     )
     parser.add_argument(
         "--model_version",
@@ -111,21 +158,70 @@ def parse_args_training():
         "--dataset_name",
         type=str,
         default="h2o",
-        choices=["h2o", "arctic"],
-        help="Dataset source to instantiate.",
+        help=(
+            "Dataset source(s) to instantiate. Supports single value like 'arctic' or comma-separated values "
+            "like 'arctic,h2o,hoi4d'."
+        ),
     )
     parser.add_argument(
         "--dataset_version",
         type=str,
         default="1_0",
-        choices=["1_0", "2_0"],
-        help="Dataset version to instantiate.",
+        help=(
+            "Dataset version(s). Supports single value like '2_0' or comma-separated values aligned with "
+            "--dataset_name, e.g. '2_0,2_0,1_0'."
+        ),
+    )
+    parser.add_argument(
+        "--val_dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "Validation dataset source(s). If not provided, it will reuse --dataset_name. "
+            "Supports single value or comma-separated values."
+        ),
+    )
+    parser.add_argument(
+        "--val_dataset_version",
+        type=str,
+        default=None,
+        help=(
+            "Validation dataset version(s). If not provided, it will reuse --dataset_version. "
+            "Supports single value or comma-separated values."
+        ),
     )
     parser.add_argument(
         "--sequence_length",
         type=int,
         default=8,
         help="Temporal window length for sequence datasets (e.g., arctic 2_0).",
+    )
+    parser.add_argument(
+        "--camera_source",
+        "--arctic_camera_source",
+        dest="camera_source",
+        type=str,
+        default="auto",
+        choices=["auto", "cache_only", "gt_only"],
+        help=(
+            "Camera parameter source for Arctic: auto uses cache when available and falls back to GT, "
+            "cache_only keeps only sequences covered by the cache, gt_only always uses dataset GT."
+        ),
+    )
+    parser.add_argument(
+        "--val_camera_source",
+        type=str,
+        default=None,
+        choices=["auto", "cache_only", "gt_only"],
+        help=(
+            "Optional camera source for Arctic validation. If not set, validation defaults to 'auto' so it can "
+            "fallback to GT when the cache is incomplete."
+        ),
+    )
+    parser.add_argument(
+        "--do_eval",
+        action="store_true",
+        help="Enable validation during training. Disabled by default for train-only runs.",
     )
     parser.add_argument(
         "--point_dropout_prob",
@@ -151,7 +247,7 @@ def parse_args_training():
         default=None,
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_epochs`, or `"latest"` to automatically select the last available checkpoint.'
+            ' `--checkpointing_epochs`/`--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
 
@@ -216,6 +312,22 @@ def parse_args_training():
     )
 
     parser.add_argument("--num_train_epochs", type=int, default=10)
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help=(
+            "If set, override epoch-based training length and stop after this many optimizer update steps."
+        ),
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help=(
+            "Run validation every N optimizer update steps. If not set, defaults to half an epoch in steps."
+        ),
+    )
 
     # save
     parser.add_argument(
@@ -225,6 +337,15 @@ def parse_args_training():
         help=(
             "Save a checkpoint of the training state every X epochs. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=None,
+        help=(
+            "Save a checkpoint of the training state every X optimizer update steps. "
+            "If set, step-based checkpointing is enabled in addition to any epoch-based checkpointing."
         ),
     )
     parser.add_argument(

@@ -44,7 +44,8 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
 
         print(f"[INFO] Loading ARCTIC dataset with setup {setup}-{split}.")
 
-        data_root = os.path.join(self.dataset_folder, "arctic/unpack/arctic_data/data")
+        # data_root = os.path.join(self.dataset_folder, "arctic/unpack/arctic_data/data")
+        data_root = self.dataset_folder
 
         split_meta_path = os.path.join(data_root, "splits", f"{self.setup}_{self.split}.npy")
         split_meta = np.load(split_meta_path, allow_pickle=True).item()
@@ -86,7 +87,8 @@ class ARCTICEgoRGBDataset(HandRGBDataset):
         else:
             raise ValueError(f"The setup {self.setup} is not supported.")
 
-        data_root = os.path.join(self.dataset_folder, "arctic/unpack/arctic_data/data")
+        # data_root = os.path.join(self.dataset_folder, "arctic/unpack/arctic_data/data")
+        data_root = self.dataset_folder
 
         for subject in subjects:
             seq_ids = os.listdir(os.path.join(data_root, "images", subject))

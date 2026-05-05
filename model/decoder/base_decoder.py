@@ -7,18 +7,15 @@ from model.component.transformer import DecoderDoubleCrossAttn, SelfAttention
 DEFAULT_HAMER_CKPT = "/data/sunzhihao2/turuirui/dataset/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
 DEFAULT_MANO_MEAN_PARAMS_PATH = "/data/sunzhihao2/turuirui/dataset/hamer/_DATA/data/mano_mean_params.npz"
 
-
 class BaseDecoder(nn.Module):
     def __init__(
         self, 
         input_dim=1280,
-        use_temporal_self_attn: bool = True,
         max_temporal_len: int = 32,
     ):
         super().__init__()
 
         self.input_dim = input_dim
-        self.use_temporal_self_attn = use_temporal_self_attn
         self.max_temporal_len = max_temporal_len
 
         self.hidden_dim = 1024
@@ -49,53 +46,14 @@ class BaseDecoder(nn.Module):
             dropout=0.0,
             emb_dropout=0.0,
             norm="layer",
-            context_dim=input_dim,
+            context_dim=input_dim, 
+            max_temporal_len=self.max_temporal_len,
         )
-
-        if self.use_temporal_self_attn:
-            self.temporal_pos_embedding = nn.Parameter(
-                torch.randn(1, max_temporal_len, self.hidden_dim) * 0.02
-            )
-            self.temporal_self_attn = SelfAttention(
-                self.hidden_dim,
-                heads=8,
-                dim_head=64,
-                dropout=0.0,
-            )
-            self.temporal_norm = nn.LayerNorm(self.hidden_dim)
-            self.temporal_alpha = nn.Parameter(torch.tensor(1.0))
 
         self._load_pretrained_decoder(self.hamer_ckpt)
 
         self.pose_head = nn.Linear(self.hidden_dim, self.pose_dim)
         self.transl_head = nn.Linear(self.hidden_dim, self.transl_dim)
-
-    def _apply_temporal_self_attention(self, tokens, batch_size, seq_len):
-        if not self.use_temporal_self_attn or seq_len <= 1:
-            return tokens
-
-        if seq_len > self.max_temporal_len:
-            raise ValueError(
-                f"seq_len={seq_len} exceeds max_temporal_len={self.max_temporal_len}"
-            )
-
-        if tokens.shape[0] != batch_size * seq_len:
-            raise ValueError(
-                f"Expected tokens with batch size {batch_size * seq_len}, got {tokens.shape[0]}"
-            )
-
-        tokens = tokens.reshape(batch_size, seq_len, 4, self.hidden_dim)
-        temporal_pos = self.temporal_pos_embedding[:, :seq_len].unsqueeze(2)
-        tokens = tokens + temporal_pos
-
-        tokens = tokens.permute(0, 2, 1, 3).reshape(batch_size * 4, seq_len, self.hidden_dim)
-        residual = tokens
-        tokens = self.temporal_norm(tokens)
-        tokens = self.temporal_self_attn(tokens)
-        tokens = residual + self.temporal_alpha * tokens
-
-        tokens = tokens.reshape(batch_size, 4, seq_len, self.hidden_dim).permute(0, 2, 1, 3)
-        return tokens.reshape(batch_size * seq_len, 4, self.hidden_dim)
 
     def _load_pretrained_decoder(self, hamer_ckpt):
         checkpoint = torch.load(hamer_ckpt, map_location="cpu")
@@ -133,7 +91,7 @@ class BaseDecoder(nn.Module):
                 f"unexpected keys: {unexpected}"
             )
 
-    def forward(self, hand_tokens, body_tokens, batch_size=None, seq_len=None):
+    def forward(self, hand_tokens, body_tokens, batch_size=None, seq_len=None, return_intermediate=False):
         flat_batch_size = body_tokens.shape[0]
         temporal_batch_size = batch_size
         if temporal_batch_size is None and seq_len is not None:
@@ -168,10 +126,9 @@ class BaseDecoder(nn.Module):
             context1_mask=hand_context_mask,
             context2=body_tokens,
             context2_mask=None,
+            batch_size=temporal_batch_size,   # ← 新增
+            seq_len=seq_len,                  # ← 新增
         )
-
-        if temporal_batch_size is not None and seq_len is not None:
-            tokens = self._apply_temporal_self_attention(tokens, temporal_batch_size, seq_len)
 
         left_pose_pred = left_init_pose + self.pose_head(tokens[:, 0])
         left_transl_pred = self.transl_head(tokens[:, 1])
@@ -181,7 +138,12 @@ class BaseDecoder(nn.Module):
         pose_pred = torch.stack([left_pose_pred, right_pose_pred], dim=1).view(flat_batch_size, 2, 16, 6)
         transl_pred = torch.stack([left_transl_pred, right_transl_pred], dim=1).view(flat_batch_size, 2, 3)
 
-        return {
+        outputs = {
             "pose": pose_pred,
             "transl": transl_pred,
         }
+
+        if return_intermediate:
+            outputs["mano_tokens"] = tokens
+
+        return outputs
