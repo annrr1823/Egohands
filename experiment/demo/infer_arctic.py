@@ -26,16 +26,38 @@ from dataset.h2o__1_0 import H2OEgoRGBDataset as H2OEgoRGBDataset__1_0
 from model.egohands__1_0 import EgoHands as EgoHands__1_0
 
 
-
 # python /data/sunzhihao2/turuirui/egohands/experiment/demo/infer_arctic.py \
-#   --checkpoint_path /data/sunzhihao2/turuirui/egohands/experiment/ckpt/v__5_0__arctic_1_0/best_mpjpe.pth \
-#   --output_dir /data/sunzhihao2/turuirui/arctic_pipeline/outputs/egohands_4 \
+#   --checkpoint_path /data/sunzhihao2/turuirui/egohands/experiment/ckpt/v__11_0__none_temporal_wo_mask_attention/best_mpjpe.pth \
+#   --output_dir /data/sunzhihao2/turuirui/arctic_pipeline/outputs/egohands_wo_maskatten \
 #   --dataset_name arctic \
 #   --split val \
 #   --batch_size 16 \
 #   --device cuda \
 #   --save_summary \
+#   --canonical_to_current_camera on
+
+
+# python /data/turuirui/egohands/experiment/demo/infer_arctic.py \
+#   --checkpoint_path /data/turuirui/egohands/experiment/ckpt/v__11_0__none_temporal/best_mpjpe.pth \
+#   --output_dir /data/turuirui/arctic_pipeline/outputs/egohands_no_temporal \
+#   --dataset_name arctic \
+#   --split val \
+#   --batch_size 16 \
+#   --device cuda \
+#   --save_summary \
+#   --canonical_to_current_camera on
+
+# python /data/turuirui/egohands/experiment/demo/infer_arctic.py \
+#   --checkpoint_path /data/turuirui/egohands/experiment/ckpt/v__6_0__arctic_1_0/best_mpjpe.pth \
+#   --output_dir /data/turuirui/arctic_pipeline/outputs/egohands_5 \
+#   --dataset_name arctic \
+#   --dataset_version 2_0 \
+#   --split val \
+#   --sequence_length 8 \
+#   --sequence_frame_stride 1 \
+#   --device cuda \
 #   --canonical_to_current_camera on \
+#   --model_camera_source cache
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run EgoHands on ARCTIC and export evalable predictions.")
@@ -59,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_version",
         type=str,
-        default="2_0",
+        default="1_0",
         choices=["1_0", "2_0"],
         help="Dataset version.",
     )
@@ -89,8 +111,14 @@ def parse_args():
     parser.add_argument(
         "--sequence_length",
         type=int,
-        default=8,
-        help="Temporal window length for sequence datasets (e.g., arctic 2_0).",
+        default=1,
+        help="Temporal window length for sequence datasets (set 1 for single-frame).",
+    )
+    parser.add_argument(
+        "--sequence_frame_stride",
+        type=int,
+        default=1,
+        help="Frame stride inside a temporal window for sequence datasets.",
     )
 
     parser.add_argument(
@@ -133,6 +161,16 @@ def parse_args():
             "to each frame's camera coordinates. "
         ),
     )
+    parser.add_argument(
+        "--model_camera_source",
+        type=str,
+        default="dataset",
+        choices=["dataset", "cache", "gt"],
+        help=(
+            "Which camera parameters are fed to EgoHands. "
+            "dataset: use dataset default tensors; cache: force *_cache; gt: force *_gt."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -161,7 +199,8 @@ def build_dataset(args, split):
             seed=args.seed,
         )
         if args.dataset_version == "1_0":
-            return DexYCBRGBDataset__1_0(**dataset_args)
+            dataset = DexYCBRGBDataset__1_0(**dataset_args)
+            return dataset
     elif args.dataset_name == "arctic":
         dataset_args = dict(
             dataset_folder=dataset_folder,
@@ -171,9 +210,11 @@ def build_dataset(args, split):
             seed=args.seed,
         )
         if args.dataset_version == "1_0":
-            return ARCTICEgoRGBDataset__1_0(**dataset_args)
+            dataset = ARCTICEgoRGBDataset__1_0(**dataset_args)
+            return dataset
         if args.dataset_version == "2_0":
-            return ARCTICEgoRGBDataset__2_0(sequence_length=args.sequence_length, **dataset_args)
+            dataset = ARCTICEgoRGBDataset__2_0(sequence_length=args.sequence_length, **dataset_args)
+            return dataset
     elif args.dataset_name == "h2o":
         dataset_args = dict(
             dataset_folder=dataset_folder,
@@ -183,7 +224,8 @@ def build_dataset(args, split):
             seed=args.seed,
         )
         if args.dataset_version == "1_0":
-            return H2OEgoRGBDataset__1_0(**dataset_args)
+            dataset = H2OEgoRGBDataset__1_0(**dataset_args)
+            return dataset
 
     raise ValueError(
         f"Unsupported dataset config: dataset_name={args.dataset_name}, dataset_version={args.dataset_version}"
@@ -202,6 +244,43 @@ def batch_to_device(batch, device):
     return out
 
 
+def select_model_camera_params(batch_device: dict, model_camera_source: str, dataset_version: str) -> None:
+    if model_camera_source == "dataset":
+        return
+
+    if model_camera_source == "cache":
+        need = ("intrinsics_cache", "intrinsics_resize_cache", "extrinsics_cache")
+        if any(key not in batch_device for key in need):
+            raise KeyError(
+                "Camera cache tensors are missing in batch. "
+                "Please use dataset 2_0 loaders with camera cache enabled."
+            )
+        batch_device["intrinsics"] = batch_device["intrinsics_cache"]
+        batch_device["intrinsics_resize"] = batch_device["intrinsics_resize_cache"]
+        batch_device["extrinsics"] = batch_device["extrinsics_cache"]
+        return
+
+    if model_camera_source == "gt":
+        need = ("intrinsics_gt", "intrinsics_resize_gt", "extrinsics_gt")
+        if any(key not in batch_device for key in need):
+            if dataset_version == "1_0":
+                print(
+                    "[infer_arctic] Warning: --model_camera_source gt is not supported for dataset_version 1_0. "
+                    "Dataset 1_0 does not provide *_gt camera fields. Falling back to dataset defaults."
+                )
+                return
+            raise KeyError(
+                "GT camera tensors are missing in batch. "
+                "Please use dataset 2_0 loaders that provide *_gt camera fields."
+            )
+        batch_device["intrinsics"] = batch_device["intrinsics_gt"]
+        batch_device["intrinsics_resize"] = batch_device["intrinsics_resize_gt"]
+        batch_device["extrinsics"] = batch_device["extrinsics_gt"]
+        return
+
+    raise ValueError(f"Unsupported model_camera_source: {model_camera_source}")
+
+
 def build_autocast_and_dtype(device, mixed_precision):
     device_type = torch.device(device).type
     if device_type != "cuda" or mixed_precision == "no":
@@ -211,6 +290,30 @@ def build_autocast_and_dtype(device, mixed_precision):
     if mixed_precision == "bf16":
         return (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)), torch.bfloat16
     raise ValueError(f"Unsupported mixed_precision: {mixed_precision}")
+
+
+def load_checkpoint(checkpoint_path: str):
+    """Load checkpoint supporting .safetensors and legacy torch checkpoints.
+
+    - If file has `.safetensors` suffix, use `safetensors` loader.
+    - Otherwise try `torch.load(..., weights_only=False)` (PyTorch>=2.6),
+      and fall back to `torch.load(..., map_location='cpu')` if that kwarg isn't accepted.
+    """
+    path = str(checkpoint_path)
+    if path.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file as _load_safetensors
+        except Exception as e:  # pragma: no cover - runtime dependency
+            raise RuntimeError(
+                "safetensors package is required to load .safetensors files. "
+                "Install with `pip install safetensors`"
+            ) from e
+        return _load_safetensors(path, device="cpu")
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
 
 def build_output_name(image_path: str) -> str:
@@ -255,7 +358,9 @@ def ensure_temporal_outputs(outputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
 
 def ensure_temporal_extrinsics(extrinsics: torch.Tensor) -> torch.Tensor:
     """Normalize extrinsics shape to [B, T, 4, 4]."""
-    if extrinsics.dim() == 4:
+    if extrinsics.dim() == 3:
+        extrinsics = extrinsics.unsqueeze(1)
+    elif extrinsics.dim() == 4 and extrinsics.shape[1] == 3 and extrinsics.shape[2] == 4:
         extrinsics = extrinsics.unsqueeze(1)
     if extrinsics.dim() == 5 and extrinsics.shape[2] == 1:
         extrinsics = extrinsics.squeeze(2)
@@ -271,6 +376,14 @@ def ensure_temporal_extrinsics(extrinsics: torch.Tensor) -> torch.Tensor:
     ).view(1, 1, 4, 4).expand(batch_size, seq_len, 4, 4).clone()
     extrinsics_4x4[..., :3, :] = extrinsics
     return extrinsics_4x4
+
+
+def ensure_temporal_betas(betas: torch.Tensor) -> torch.Tensor:
+    if betas.dim() == 3:
+        betas = betas.unsqueeze(1)
+    if betas.dim() != 4 or tuple(betas.shape[-2:]) != (2, 10):
+        raise ValueError(f"Unexpected betas shape: {tuple(betas.shape)}")
+    return betas
 
 
 def transform_kp3d_with_4x4(kp3d_pred: np.ndarray, transform_4x4: np.ndarray) -> np.ndarray:
@@ -347,7 +460,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    # checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    checkpoint = load_checkpoint(args.checkpoint_path)
+    
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
     if isinstance(state_dict, dict) and any(key.startswith("module.") for key in state_dict.keys()):
         state_dict = {key.replace("module.", "", 1): value for key, value in state_dict.items()}
@@ -377,6 +492,9 @@ def main():
     model.eval()
 
     dataset = build_dataset(args, split=args.split)
+    if hasattr(dataset, "sequence_frame_stride"):
+        dataset.sequence_frame_stride = int(args.sequence_frame_stride)
+        print(f"[infer_arctic] Using sequence_frame_stride={dataset.sequence_frame_stride}.")
 
     if args.max_samples > 0:
         dataset = torch.utils.data.Subset(dataset, list(range(min(args.max_samples, len(dataset)))))
@@ -401,6 +519,7 @@ def main():
         for batch in pbar:
             batch_size = batch["image"].shape[0]
             batch_device = batch_to_device(batch, device)
+            select_model_camera_params(batch_device, args.model_camera_source, args.dataset_version)
 
             extrinsics_seq = ensure_temporal_extrinsics(batch["extrinsics"]).detach().cpu().numpy()
 
@@ -410,6 +529,8 @@ def main():
             pose_pred_t, transl_pred_t = ensure_temporal_outputs(outputs)
             pose_pred = pose_pred_t.detach().cpu().numpy()
             transl_pred = transl_pred_t.detach().cpu().numpy()
+
+            betas_t = ensure_temporal_betas(batch_device["betas"])
 
             hand_side_mask_t = batch["hand_side_mask"]
             if hand_side_mask_t.dim() == 2:
@@ -434,10 +555,11 @@ def main():
                         pose_pred=pose_pred_t[i, t],
                         transl_pred=transl_pred_t[i, t],
                         hand_side_mask=torch.as_tensor(hand_side_mask[i, t]),
-                        betas=batch_device["betas"][i, t],
+                        betas=betas_t[i, t],
                     )
 
-                    if apply_canonical_to_current:
+                    should_transform = apply_canonical_to_current and args.dataset_version == "2_0"
+                    if should_transform:
                         # For ARCTIC 2_0 sequence training, extrinsics are T_curr_to_canonical.
                         # We need T_canonical_to_curr for eval outputs in each frame camera coordinates.
                         t_curr_to_canonical = extrinsics_seq[i, t].astype(np.float32)
@@ -448,8 +570,12 @@ def main():
                         "pose_pred": pose_pred[i, t].astype(np.float32),
                         "transl_pred": transl_pred[i, t].astype(np.float32),
                         "hand_side_mask": hand_side_mask[i, t].astype(np.float32),
-                        "coord_semantics": "camera_current_frame" if apply_canonical_to_current else "camera_canonical_first_frame",
-                        "canonical_to_current_camera_applied": bool(apply_canonical_to_current),
+                        "coord_semantics": (
+                            "camera_current_frame"
+                            if should_transform or args.dataset_version == "1_0"
+                            else "camera_canonical_first_frame"
+                        ),
+                        "canonical_to_current_camera_applied": bool(should_transform),
                         "joint_order": "openpose",
                         "seq_id": str(meta.get("seq_id", "")),
                         "frame_id": str(image_path),
@@ -476,7 +602,8 @@ def main():
         "num_files_saved": saved_files,
         "num_files_skipped": skipped_files,
         "canonical_to_current_camera": args.canonical_to_current_camera,
-        "canonical_to_current_camera_applied": bool(apply_canonical_to_current),
+        "canonical_to_current_camera_applied": bool(apply_canonical_to_current and args.dataset_version == "2_0"),
+        "model_camera_source": args.model_camera_source,
         "note": "Run /data/turuirui/arctic_pipeline/evaluation/eval.py on this output_dir for ARCTIC metrics.",
     }
 

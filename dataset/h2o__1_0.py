@@ -60,14 +60,20 @@ class H2OEgoRGBDataset(HandRGBDataset):
         """
         sequences: List[dict] = []
 
-        data_root = os.path.join(self.dataset_folder, "ego")
+        data_root = Path(self.dataset_folder)
+        ego_root = data_root / "ego"
+        if ego_root.exists():
+            data_root = ego_root
+            subject_suffix = "_ego"
+        else:
+            subject_suffix = ""
 
         if self.setup == "default":
             task = "pose"
         else:
             raise ValueError(f"The setup {self.setup} is not supported.")
 
-        split_file_path = os.path.join(data_root, "label_split", f"{task}_{self.split}.txt")
+        split_file_path = os.path.join("/data/sunzhihao2/turuirui/h2o_pipeline", "label_split", f"{task}_{self.split}.txt")
 
         with open(split_file_path, "r") as f:
             frame_names = [line.strip() for line in f if line.strip()]
@@ -76,14 +82,14 @@ class H2OEgoRGBDataset(HandRGBDataset):
         for frame_name in frame_names:
             parts = frame_name.split("/")
 
-            image_path = os.path.join(data_root, f"{parts[0]}_ego", *parts[1:])
-            if not os.path.exists(image_path):
+            image_path = data_root / f"{parts[0]}{subject_suffix}" / Path(*parts[1:])
+            if not image_path.exists():
                 continue
             
             seq_id = "/".join(parts[:3])
             if seq_id not in seq_dict:
                 seq_dict[seq_id] = []
-            seq_dict[seq_id].append(image_path)
+            seq_dict[seq_id].append(str(image_path))
 
         for seq_id, frame_ids in seq_dict.items():
             frame_ids.sort(key=lambda x: int(Path(x).stem))

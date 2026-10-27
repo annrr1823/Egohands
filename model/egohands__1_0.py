@@ -72,24 +72,22 @@ class EgoHands(nn.Module):
         return x, True
     
     def _build_plucker_tokens(self, batch, batch_size, seq_len, device, dtype):
-        extrinsics = batch["extrinsics"].to(device=device, dtype=dtype)
         intrinsics = batch.get("intrinsics_resize", batch["intrinsics"]).to(device=device, dtype=dtype)
-
-        if extrinsics.dim() == 4:
-            extrinsics = extrinsics.unsqueeze(1)
-        if extrinsics.dim() == 5 and extrinsics.shape[2] == 1:
-            extrinsics = extrinsics.squeeze(2)
 
         if intrinsics.dim() == 3:
             intrinsics = intrinsics.unsqueeze(1)
         if intrinsics.dim() == 4 and intrinsics.shape[2] == 1:
             intrinsics = intrinsics.squeeze(2)
 
-        extrinsics = extrinsics.reshape(batch_size, seq_len, 3, 4)
         intrinsics = intrinsics.reshape(batch_size, seq_len, 4)
 
-        extrinsics_4x4 = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4).expand(batch_size, seq_len, 4, 4).clone()
-        extrinsics_4x4[..., :3, :] = extrinsics
+        # Use identity extrinsics so Plucker embedding depends only on intrinsics.
+        extrinsics_4x4 = (
+            torch.eye(4, device=device, dtype=dtype)
+            .view(1, 1, 4, 4)
+            .expand(batch_size, seq_len, 4, 4)
+            .clone()
+        )
 
         plucker_tokens = self.plucker_ray(
             extrinsics=extrinsics_4x4,
@@ -139,15 +137,13 @@ class EgoHands(nn.Module):
             body_tokens = self.body_plucker_fuse(body_tokens)
 
         hand_images = torch.stack([left_hand_images_bt, right_hand_images_bt], dim=1)
-        hand_feat = self.hand_backbone(hand_images)
+        hand_feat = self.hand_backbone(hand_images) 
         bt, num_side, feat_dim, feat_height, feat_width = hand_feat.shape
         hand_tokens = hand_feat.permute(0, 1, 3, 4, 2).reshape(bt, num_side, feat_height * feat_width, feat_dim)
 
         outputs_bt = self.decoder(
             hand_tokens,
             body_tokens,
-            batch_size=batch_size,
-            seq_len=seq_len,
             return_intermediate=return_intermediate,
         )
         pose_pred_bt = outputs_bt["pose"]

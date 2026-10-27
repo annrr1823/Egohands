@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import Dataset
 
 from model.smpl.mano import MANOLayer, MANO_PATH
+from dataset.utils.utils import _pad_clip, _temporal_stack
 
 
 class HandRGBDataset(Dataset):
@@ -25,10 +26,17 @@ class HandRGBDataset(Dataset):
         self,
         image_size: Tuple[int, int] = (512, 512),
         extra_anno_keys: Sequence[Literal["extrinsics"]] = [],
+        clip_len: int = 1,
+        random_clip_for_train: bool = True,
         seed: Optional[int] = None,
     ):
         super().__init__()
         self.extra_anno_keys = set(extra_anno_keys) if extra_anno_keys is not None else None
+        self.clip_len = int(clip_len)
+        self.random_clip_for_train = bool(random_clip_for_train)
+
+        if self.clip_len <= 0:
+            raise ValueError(f"clip_len must be positive, got {self.clip_len}.")
 
         self.image_size = image_size
         self.image_mean = np.array([0.485, 0.456, 0.406])
@@ -77,19 +85,24 @@ class HandRGBDataset(Dataset):
         sequence_cache_file = getattr(self, "sequence_cache_file", None)
         sequence_cache_file = Path(sequence_cache_file) if sequence_cache_file else None
         
+        sequences = None
         if sequence_cache_file is not None and sequence_cache_file.exists():
             print(f"[INFO] Loading sequences from cache {sequence_cache_file}.")
+            try:
+                with open(sequence_cache_file, "rb") as f:
+                    sequences = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError) as exc:
+                print(f"[WARN] Failed to load cache {sequence_cache_file}: {exc}. Rebuilding cache.")
 
-            with open(sequence_cache_file, "rb") as f:
-                sequences = pickle.load(f)
-        else:
+        if sequences is None:
             sequences = self.collect_sequences()
 
             if sequence_cache_file is not None:
                 sequence_cache_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(sequence_cache_file, "wb") as f:
+                tmp_path = sequence_cache_file.with_suffix(sequence_cache_file.suffix + ".tmp")
+                with open(tmp_path, "wb") as f:
                     pickle.dump(sequences, f, protocol=pickle.HIGHEST_PROTOCOL)
-
+                os.replace(tmp_path, sequence_cache_file)
                 print(f"[INFO] Saved sequences cache to {sequence_cache_file}.")
 
         self.frames = []
@@ -137,10 +150,35 @@ class HandRGBDataset(Dataset):
     
     def __len__(self) -> int:
         return len(self.frames)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        frame = self.frames[idx]
 
+    def _sample_clip_frames(self, idx: int) -> List[Dict[str, Any]]:
+        frame = self.frames[idx]
+        if self.clip_len == 1:
+            return [frame]
+
+        seq_id = frame["seq_id"]
+        seq_idx = self.seqs_map[seq_id]
+        seq_info = self.seqs[seq_idx]
+
+        seq_start = int(seq_info["start"])
+        seq_length = int(seq_info["length"])
+        rel_t = int(frame["t"])
+
+        max_start = max(seq_length - self.clip_len, 0)
+        if getattr(self, "split", "train") == "train" and self.random_clip_for_train and max_start > 0:
+            start_rel = self.random.randint(0, max_start)
+        else:
+            start_rel = min(max(rel_t - self.clip_len // 2, 0), max_start)
+
+        clip = []
+        clip_end = min(start_rel + self.clip_len, seq_length)
+        for t in range(start_rel, clip_end):
+            clip.append(self.frames[seq_start + t])
+
+        clip = _pad_clip(clip, target_len=self.clip_len, pad_mode="repeat")
+        return clip
+
+    def _load_single_frame(self, frame: Dict[str, Any], index: int) -> Dict[str, Any]:
         anno = self.read_annos(frame)
         image_dict = self.read_image(frame, anno)
 
@@ -153,6 +191,7 @@ class HandRGBDataset(Dataset):
         sample = {
             "hand_side": anno["hand_side"],
             "hand_side_mask": anno["hand_side_mask"],
+            "mano_side_mask": anno.get("mano_side_mask", anno["hand_side_mask"]),
             "object": anno["object"],
             "image": image_dict["image"],
             "left_hand_image": image_dict["left_hand_image"],
@@ -167,10 +206,27 @@ class HandRGBDataset(Dataset):
             "intrinsics_resize": anno["intrinsics_resize"],
             "extrinsics": anno["extrinsics"],
             "meta": {
-                "index": idx,
+                "index": index,
                 **frame_meta,
             },
         }
+
+        return sample
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        clip_frames = self._sample_clip_frames(idx)
+        clip_samples = [self._load_single_frame(frame, idx) for frame in clip_frames]
+
+        if self.clip_len == 1:
+            return clip_samples[0]
+
+        sample = {}
+        keys = clip_samples[0].keys()
+        for key in keys:
+            if key == "meta":
+                sample[key] = [item[key] for item in clip_samples]
+            else:
+                sample[key] = _temporal_stack([item[key] for item in clip_samples])
 
         return sample
     

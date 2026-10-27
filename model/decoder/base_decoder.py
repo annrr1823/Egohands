@@ -11,12 +11,12 @@ class BaseDecoder(nn.Module):
     def __init__(
         self, 
         input_dim=1280,
-        max_temporal_len: int = 32,
+        use_hand_context_mask: bool = True,
     ):
         super().__init__()
 
         self.input_dim = input_dim
-        self.max_temporal_len = max_temporal_len
+        self.use_hand_context_mask = use_hand_context_mask
 
         self.hidden_dim = 1024
         self.hamer_ckpt = DEFAULT_HAMER_CKPT
@@ -47,7 +47,6 @@ class BaseDecoder(nn.Module):
             emb_dropout=0.0,
             norm="layer",
             context_dim=input_dim, 
-            max_temporal_len=self.max_temporal_len,
         )
 
         self._load_pretrained_decoder(self.hamer_ckpt)
@@ -91,15 +90,8 @@ class BaseDecoder(nn.Module):
                 f"unexpected keys: {unexpected}"
             )
 
-    def forward(self, hand_tokens, body_tokens, batch_size=None, seq_len=None, return_intermediate=False):
+    def forward(self, hand_tokens, body_tokens, return_intermediate=False):
         flat_batch_size = body_tokens.shape[0]
-        temporal_batch_size = batch_size
-        if temporal_batch_size is None and seq_len is not None:
-            if flat_batch_size % seq_len != 0:
-                raise ValueError(
-                    f"Cannot infer temporal batch size from flat_batch_size={flat_batch_size} and seq_len={seq_len}"
-                )
-            temporal_batch_size = flat_batch_size // seq_len
 
         left_init_pose = self.init_pose.expand(flat_batch_size, -1)
         right_init_pose = self.init_pose.expand(flat_batch_size, -1)
@@ -114,11 +106,19 @@ class BaseDecoder(nn.Module):
         num_left_tokens = hand_tokens.shape[2]
         hand_tokens = hand_tokens.reshape(flat_batch_size, -1, hand_tokens.shape[-1])
 
-        hand_context_mask = torch.ones(flat_batch_size, 4, hand_tokens.shape[1], dtype=torch.bool, device=hand_tokens.device)
-        hand_context_mask[:, 0, :num_left_tokens] = False
-        hand_context_mask[:, 1, :num_left_tokens] = False
-        hand_context_mask[:, 2, num_left_tokens:] = False
-        hand_context_mask[:, 3, num_left_tokens:] = False
+        hand_context_mask = None
+        if self.use_hand_context_mask:
+            hand_context_mask = torch.ones(
+                flat_batch_size,
+                4,
+                hand_tokens.shape[1],
+                dtype=torch.bool,
+                device=hand_tokens.device,
+            )
+            hand_context_mask[:, 0, :num_left_tokens] = False
+            hand_context_mask[:, 1, :num_left_tokens] = False
+            hand_context_mask[:, 2, num_left_tokens:] = False
+            hand_context_mask[:, 3, num_left_tokens:] = False
 
         tokens = self.decoder(
             tokens,
@@ -126,8 +126,6 @@ class BaseDecoder(nn.Module):
             context1_mask=hand_context_mask,
             context2=body_tokens,
             context2_mask=None,
-            batch_size=temporal_batch_size,   # ← 新增
-            seq_len=seq_len,                  # ← 新增
         )
 
         left_pose_pred = left_init_pose + self.pose_head(tokens[:, 0])

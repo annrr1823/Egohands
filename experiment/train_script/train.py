@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from typing import List, Tuple
 
 import pyrootutils
 root = pyrootutils.setup_root(
@@ -19,10 +20,9 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 import transformers
 
-from dataset.hand_rgb__2_0 import collate_fn_rgb
+from dataset.hand_rgb__1_0 import collate_fn_rgb
 from dataset.dexycb__1_0 import DexYCBRGBDataset as DexYCBRGBDataset__1_0
 from dataset.arctic__1_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__1_0
-from dataset.arctic__2_0 import ARCTICEgoRGBDataset as ARCTICEgoRGBDataset__2_0
 from dataset.h2o__1_0 import H2OEgoRGBDataset as H2OEgoRGBDataset__1_0
 from model.egohands__1_0 import EgoHands as EgoHands__1_0
 from experiment.utils.args import parse_args_training
@@ -37,46 +37,146 @@ def build_model(args):
         raise ValueError(f"Unsupported model_version: {args.model_version}")
 
 
-def build_dataset(args, split):
-    if args.dataset_name == "dexycb":
+def _load_pretrained_state_dict(path: str):
+    """Load a state dict from a path.
+
+    Supports:
+    - directory containing `model.safetensors` or common checkpoint names
+    - a .safetensors file
+    - standard PyTorch checkpoint files (.pt/.pth/.bin/.pkl)
+    """
+    if os.path.isdir(path):
+        safetensors_path = os.path.join(path, "model.safetensors")
+        pkl_path = os.path.join(path, "custom_checkpoint_0.pkl")
+        common_names = [
+            "model.pth",
+            "model.pt",
+            "model.bin",
+            "pytorch_model.bin",
+            "weights.pth",
+        ]
+
+        if os.path.exists(safetensors_path):
+            try:
+                from safetensors.torch import load_file as safetensors_load
+
+                return safetensors_load(safetensors_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Found model.safetensors but could not import safetensors. "
+                    "Install the `safetensors` package to load it."
+                ) from exc
+
+        if os.path.exists(pkl_path):
+            checkpoint = torch.load(pkl_path, map_location="cpu")
+            return checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+
+        for name in common_names:
+            fp = os.path.join(path, name)
+            if os.path.exists(fp):
+                checkpoint = torch.load(fp, map_location="cpu")
+                return checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+
+        raise ValueError(f"No supported checkpoint file found in directory: {path}")
+
+    if path.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file as safetensors_load
+
+            return safetensors_load(path)
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import safetensors. Install the `safetensors` package to load .safetensors files."
+            ) from exc
+
+    checkpoint = torch.load(path, map_location="cpu")
+    return checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+
+
+def _parse_multi_dataset_args(args, split: str) -> List[Tuple[str, str]]:
+    # Validation can optionally use a different dataset list.
+    dataset_name_value = args.dataset_name
+    dataset_version_value = args.dataset_version
+
+    if split == "val":
+        if getattr(args, "val_dataset_name", None):
+            dataset_name_value = args.val_dataset_name
+        if getattr(args, "val_dataset_version", None):
+            dataset_version_value = args.val_dataset_version
+
+    dataset_names = [item.strip() for item in dataset_name_value.split(",") if item.strip()]
+    dataset_versions = [item.strip() for item in dataset_version_value.split(",") if item.strip()]
+
+    if len(dataset_names) == 0:
+        raise ValueError(f"dataset_name for split='{split}' is empty.")
+
+    if len(dataset_versions) == 1 and len(dataset_names) > 1:
+        dataset_versions = dataset_versions * len(dataset_names)
+
+    if len(dataset_names) != len(dataset_versions):
+        raise ValueError(
+            f"The number of dataset names ({len(dataset_names)}) must match the number of dataset versions ({len(dataset_versions)})."
+        )
+
+    return list(zip(dataset_names, dataset_versions))
+
+
+def _build_single_dataset(dataset_name: str, dataset_version: str, args, split: str):
+    if dataset_version != "1_0":
+        raise ValueError(
+            f"Temporal dataset_version={dataset_version} is not supported for single-frame training."
+        )
+
+    if dataset_name == "dexycb":
         dataset_args = dict(
             dataset_folder="/data/public/dataset/hand/dexycb",
             image_size=(512, 512),
             split=split,
             setup="s0",
             seed=args.seed,
+            clip_len=1,
         )
-        if args.dataset_version == "1_0":
+        if dataset_version == "1_0":
             return DexYCBRGBDataset__1_0(**dataset_args)
-    elif args.dataset_name == "arctic":
+    elif dataset_name == "arctic":
         dataset_args = dict(
             dataset_folder="/data/sunzhihao2/turuirui/dataset/arctic/data/data",
             image_size=(512, 512),
             split=split,
             setup="p1",
             seed=args.seed,
+            clip_len=1,
         )
-        if args.dataset_version == "1_0":
+        if dataset_version == "1_0":
             return ARCTICEgoRGBDataset__1_0(**dataset_args)
-        if args.dataset_version == "2_0":
-            return ARCTICEgoRGBDataset__2_0(
-                sequence_length=args.sequence_length,
-                **dataset_args,
-            )
-    elif args.dataset_name == "h2o":
+    elif dataset_name == "h2o":
         dataset_args = dict(
-            dataset_folder="/data/public/dataset/hand/h2o",
+            dataset_folder="/data/public/hand/h2o",
             image_size=(512, 512),
             split=split,
             setup="default",
             seed=args.seed,
+            clip_len=1,
         )
-        if args.dataset_version == "1_0":
+        if dataset_version == "1_0":
             return H2OEgoRGBDataset__1_0(**dataset_args)
 
     raise ValueError(
-        f"Unsupported dataset config: dataset_name={args.dataset_name}, dataset_version={args.dataset_version}"
+        f"Unsupported dataset config: dataset_name={dataset_name}, dataset_version={dataset_version}"
     )
+
+
+def build_dataset(args, split):
+    dataset_configs = _parse_multi_dataset_args(args, split=split)
+    datasets_to_concat = [
+        _build_single_dataset(dataset_name=name, dataset_version=version, args=args, split=split)
+        for name, version in dataset_configs
+    ]
+
+    if len(datasets_to_concat) == 1:
+        return datasets_to_concat[0], dataset_configs
+
+    return torch.utils.data.ConcatDataset(datasets_to_concat), dataset_configs
 
 
 def main():
@@ -121,7 +221,7 @@ def main():
         set_seed(args.seed)
 
     # [STRUCTURE] Build dataloaders.
-    train_dataset = build_dataset(args, split="train")
+    train_dataset, train_dataset_configs = build_dataset(args, split="train")
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -130,7 +230,7 @@ def main():
         collate_fn=collate_fn_rgb,
     )
 
-    val_dataset = build_dataset(args, split="val")
+    val_dataset, val_dataset_configs = build_dataset(args, split="val")
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         shuffle=False,
@@ -143,10 +243,12 @@ def main():
     model = build_model(args)
     if args.pretrained_path:
         logger.info(f"Loading pretrained weights from {args.pretrained_path}.")
-        checkpoint = torch.load(args.pretrained_path, map_location="cpu")
-        # checkpoint = torch.load("/data/sunzhihao2/turuirui/egohands/third_party/ckpt/model_dino.ckpt", map_location="cpu")
-        state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-        model.load_state_dict(state_dict, strict=not args.use_plucker_ray)
+        state_dict = _load_pretrained_state_dict(args.pretrained_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"Missing keys when loading pretrained weights: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected keys when loading pretrained weights: {unexpected}")
     model.train()
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -225,6 +327,8 @@ def main():
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
+    logger.info(f"Train datasets = {train_dataset_configs}")
+    logger.info(f"Val datasets = {val_dataset_configs}")
     logger.info(f"Num examples = {len(train_dataset)}")
     logger.info(f"Num epochs = {args.num_train_epochs}")
     logger.info(f"Instantaneous batch size per device = {args.train_batch_size}")
